@@ -1,0 +1,93 @@
+name: forgegrid
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: forgegrid
+      POSTGRES_PASSWORD: forgegrid
+      POSTGRES_DB: forgegrid
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgegrid -d forgegrid"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  control-plane:
+    build: .
+    image: forgegrid:dev
+    command: ["controlplane"]
+    environment:
+      DATABASE_URL: postgres://forgegrid:forgegrid@postgres:5432/forgegrid?sslmode=disable
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-2s}
+      OFFLINE_THRESHOLD: ${OFFLINE_THRESHOLD:-6s}
+      EXECUTION_LEASE: ${EXECUTION_LEASE:-10s}
+      RETRY_BASE: ${RETRY_BASE:-1s}
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/healthz"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  worker-a: &worker
+    image: forgegrid:dev
+    pull_policy: never
+    command: ["worker"]
+    restart: unless-stopped
+    environment:
+      CONTROL_PLANE_ADDR: control-plane:9090
+      WORKER_ID: worker-a
+      LEASE_RENEW_INTERVAL: ${LEASE_RENEW_INTERVAL:-2s}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      control-plane:
+        condition: service_healthy
+  worker-b:
+    <<: *worker
+    environment:
+      CONTROL_PLANE_ADDR: control-plane:9090
+      WORKER_ID: worker-b
+      LEASE_RENEW_INTERVAL: ${LEASE_RENEW_INTERVAL:-2s}
+  worker-c:
+    <<: *worker
+    environment:
+      CONTROL_PLANE_ADDR: control-plane:9090
+      WORKER_ID: worker-c
+      LEASE_RENEW_INTERVAL: ${LEASE_RENEW_INTERVAL:-2s}
+  verify:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile.tools
+    image: forgegrid-tools
+    environment:
+      TEST_DATABASE_URL: postgres://forgegrid:forgegrid@postgres:5432/forgegrid?sslmode=disable
+      TEST_HTTP_URL: http://control-plane:8080
+      TEST_GRPC_ADDR: control-plane:9090
+    volumes:
+      - .:/src
+      - go-mod:/go/pkg/mod
+      - go-build:/root/.cache/go-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["go", "test", "-race", "-tags", "integration", "./..."]
+  result-replay:
+    profiles: ["tools"]
+    image: forgegrid:dev
+    pull_policy: never
+    entrypoint: ["replay-result"]
+    environment:
+      CONTROL_PLANE_ADDR: control-plane:9090
+volumes:
+  postgres-data:
+  go-mod:
+  go-build:

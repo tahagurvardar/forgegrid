@@ -1,0 +1,15 @@
+# Worker protocol v1
+
+Source: api/proto/forgegrid/v1/worker.proto. Generated Go bindings are committed under gen/go/forgegrid/v1.
+
+WorkerControl.Connect is a worker-initiated bidirectional control stream. First message is Register(worker_id, worker_session_id, capacity_slots=1). The stable worker ID persists across restarts; the process creates a new session UUID once at startup. Registration creates a new session and supersedes any ONLINE session of the same worker. Session IDs are not reusable. Transport failure eventually ends the worker process after its local authority is stopped; Compose starts a fresh process/session.
+
+Registered returns the heartbeat interval. Heartbeat contains session identity only; the Control Plane records its own receipt time and does not renew attempts. RunAttempt contains attempt ID, fencing token, session ID, job ID, attempt number, image, argv, and timeout. The absolute authoritative expiry is in PostgreSQL and exposed by job inspection; the worker obtains its own execution allowance through LeaseRenewRequest/LeaseRenewed before starting.
+
+Worker acknowledges assignment, requests initial lease renewal, creates/starts its Docker container, reports AttemptStarted, and periodically requests renewal. Each request has a monotonically increasing request ID. Only a matching successful ACK updates its monotonic local deadline, measured from request-send time. Rejected identity/lease operations can produce CancelAttempt, used internally to stop stale execution. AttemptCompleted/AttemptFailed receive ResultAck with accepted, duplicate, and error. Worker retains and resends a pending result until acknowledged while continuing valid renewal requests. A result rejected for stale authority cannot change the job.
+
+WorkerControl.ReportResult is a unary entry into the same PostgreSQL completion implementation. It permits diagnostic replay of a delayed result without reviving or registering its old session. The recovery demo uses tests/recovery/replay to invoke it and requires an explicit STALE_ATTEMPT response. This trusted development protocol has no authentication.
+
+WorkerLogs.Stream is a separate bidirectional RPC, used on a distinct worker gRPC connection. Each bounded chunk carries attempt ID, fence, session ID, one per-attempt sequence shared across stdout/stderr, stream, and bytes. The initial implementation opens a short stream for each chunk with a 3s deadline, sends the chunk, waits for a persistence ACK, and closes it. Up to three attempts resend that same sequence; the database primary key makes duplicates harmless. There is one outstanding log chunk at a time and a 64-chunk bounded queue. This favors a simple bounded transport over throughput in this slice. Control messages never wait on log acknowledgements.
+
+Logs may remain diagnostic after an attempt is terminal or stale, but immutable identity must match its original attempt. Old logs cannot enter the new attempt's stream. HTTP log retrieval is ordered and paginated; no browser streaming layer is implemented.

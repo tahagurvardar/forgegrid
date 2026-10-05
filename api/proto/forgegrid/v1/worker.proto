@@ -1,0 +1,43 @@
+syntax = "proto3";
+package forgegrid.v1;
+option go_package = "forgegrid/gen/go/forgegrid/v1;forgegridv1";
+
+service WorkerControl {
+ rpc Connect(stream WorkerMessage) returns (stream ControlMessage);
+ // Same authoritative completion path; also allows a delayed result to be replayed in the demo.
+ rpc ReportResult(AttemptResult) returns (ResultAck);
+}
+service WorkerLogs {
+ // Separate RPC and worker connection. Each ACK confirms PostgreSQL persistence.
+ rpc Stream(stream LogChunk) returns (stream LogAck);
+}
+message AttemptIdentity { string attempt_id = 1; int64 fencing_token = 2; string worker_session_id = 3; }
+message Register { string worker_id = 1; string worker_session_id = 2; int32 capacity_slots = 3; }
+message Heartbeat { string worker_session_id = 1; }
+message AttemptResult { AttemptIdentity identity = 1; string state = 2; int32 exit_code = 3; string failure_kind = 4; string detail = 5; }
+message AssignmentRejected { AttemptIdentity identity = 1; string reason = 2; }
+message LeaseRenewRequest { AttemptIdentity identity = 1; uint64 request_id = 2; }
+message WorkerMessage {
+ oneof body {
+  Register register = 1;
+  Heartbeat heartbeat = 2;
+  AttemptIdentity assignment_accepted = 3;
+  AssignmentRejected assignment_rejected = 4;
+  AttemptIdentity attempt_started = 5;
+  LeaseRenewRequest lease_renew_request = 6;
+  AttemptResult attempt_completed = 7;
+  AttemptResult attempt_failed = 8;
+ }
+}
+message Registered { string worker_session_id = 1; int64 heartbeat_interval_ms = 2; }
+message RunAttempt { AttemptIdentity identity = 1; string job_id = 2; int32 attempt_number = 3; string image = 4; repeated string command = 5; int32 timeout_seconds = 6; }
+// The worker computes its monotonic deadline from request-send time, not ACK-receive time.
+// This conservatively accounts for network/queue delay without synchronized wall clocks.
+message LeaseRenewed { AttemptIdentity identity = 1; uint64 request_id = 2; int64 ttl_ms = 3; }
+message ResultAck { AttemptIdentity identity = 1; bool accepted = 2; bool duplicate = 3; string error = 4; }
+message CancelAttempt { AttemptIdentity identity = 1; string reason = 2; }
+message ControlMessage {
+ oneof body { Registered registered = 1; RunAttempt run_attempt = 2; LeaseRenewed lease_renewed = 3; ResultAck result_ack = 4; CancelAttempt cancel_attempt = 5; }
+}
+message LogChunk { AttemptIdentity identity = 1; int64 sequence = 2; string stream = 3; bytes payload = 4; }
+message LogAck { int64 sequence = 1; }
