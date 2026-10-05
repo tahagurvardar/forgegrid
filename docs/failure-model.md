@@ -40,3 +40,9 @@ Run `scripts/verify-recovery.ps1` for isolated-schema, separate-process crash te
 | Control Send fails while Recv blocks | Handler observes send failure independently and disconnects; ownership remains reserved. |
 
 Execution budget excludes queue/dependency wait and includes preparation/log drain/accepted reporting. PostgreSQL deadlines are independent of scanning and never renewed. ACK budgets avoid a fresh timeout on delayed delivery. See the [pipeline audit](pipeline-semantics-audit.md). Run scripts/demo-pipeline.ps1 for parallel success/failure and scripts/demo-pipeline-recovery.ps1 for fenced worker-b → worker-c recovery inside the DAG.
+
+## Telemetry failures
+
+Console/API refresh or SSE disconnection affects inspection only. Last successful snapshots are explicitly stale; SSE resumes by persisted sequence and keeps bounded browser memory. The recovery timeline distinguishes stored lease expiry/LOST from the exact offline-transition timestamp, which is not persisted. Historical attempts remain diagnostic and visible. See [operational-console-audit.md](operational-console-audit.md).
+
+Collector missing at startup or lost during execution, Jaeger unavailability, missing Prometheus scrapes, export timeouts, and full export queues can lose telemetry but cannot grant/revoke leases or finalize jobs. Bounded background export drops spans under pressure. Cached read-only metric sampling never uses the coordination pool; failed samples retain prior values with explicit health/age metrics. A worker crash may leave its execution span incomplete while Control Plane recovery spans explain the persisted LOST/retry outcome. See [observability-audit.md](observability-audit.md), scripts/verify-observability.ps1, and scripts/demo-observability.ps1.

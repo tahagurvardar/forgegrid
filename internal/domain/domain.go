@@ -54,6 +54,11 @@ type Identity struct {
 }
 type Attempt struct {
 	Identity
+	TraceParent       string     `json:"-"`
+	AssignedAt        time.Time  `json:"assigned_at"`
+	StartedAt         *time.Time `json:"started_at"`
+	FinishedAt        *time.Time `json:"finished_at"`
+	TraceID           string     `json:"trace_id,omitempty"`
 	JobID             string     `json:"job_id"`
 	Number            int        `json:"attempt_number"`
 	WorkerID          string     `json:"worker_id"`
@@ -65,10 +70,14 @@ type Attempt struct {
 	FailureDetail     string     `json:"failure_detail"`
 }
 type Job struct {
-	ID           string   `json:"id"`
-	PipelineID   *string  `json:"pipeline_id,omitempty"`
-	Key          *string  `json:"key,omitempty"`
-	Dependencies []string `json:"dependencies,omitempty"`
+	TraceParent      string     `json:"-"`
+	CreatedAt        time.Time  `json:"created_at"`
+	FinishedAt       *time.Time `json:"finished_at"`
+	RetryAvailableAt *time.Time `json:"retry_available_at"`
+	ID               string     `json:"id"`
+	PipelineID       *string    `json:"pipeline_id,omitempty"`
+	Key              *string    `json:"key,omitempty"`
+	Dependencies     []string   `json:"dependencies,omitempty"`
 	Spec
 	State            string    `json:"state"`
 	CurrentAttemptID *string   `json:"current_attempt_id"`

@@ -5,18 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"forgegrid/db/migrations"
 	"forgegrid/internal/domain"
+	"forgegrid/internal/observability"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Store struct {
 	Pool                      *pgxpool.Pool
 	Lease, Offline, RetryBase time.Duration
+	Metrics                   *observability.Metrics
 }
 
 func Open(ctx context.Context, url string, lease, offline, retry time.Duration) (*Store, error) {
@@ -28,7 +33,7 @@ func Open(ctx context.Context, url string, lease, offline, retry time.Duration) 
 		p.Close()
 		return nil, err
 	}
-	return &Store{p, lease, offline, retry}, nil
+	return &Store{Pool: p, Lease: lease, Offline: offline, RetryBase: retry}, nil
 }
 func (s *Store) Migrate(ctx context.Context) error {
 	tx, err := s.Pool.Begin(ctx)
@@ -48,9 +53,14 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, migrations.PipelineSemantics); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(ctx, migrations.Observability); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 func (s *Store) Submit(ctx context.Context, spec domain.Spec) (string, error) {
+	ctx, span := observability.Start(ctx, "job.submit")
+	defer span.End()
 	if err := spec.Validate(); err != nil {
 		return "", err
 	}
@@ -59,7 +69,7 @@ func (s *Store) Submit(ctx context.Context, spec domain.Spec) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, err = s.Pool.Exec(ctx, `INSERT INTO jobs(id,state,image,command,timeout_seconds,max_attempts) VALUES($1,'QUEUED',$2,$3,$4,$5)`, id, spec.Image, argv, spec.TimeoutSeconds, spec.MaxAttempts)
+	_, err = s.Pool.Exec(ctx, `INSERT INTO jobs(id,state,image,command,timeout_seconds,max_attempts,trace_parent,last_queued_at) VALUES($1,'QUEUED',$2,$3,$4,$5,$6,clock_timestamp())`, id, spec.Image, argv, spec.TimeoutSeconds, spec.MaxAttempts, observability.Carrier(ctx))
 	return id, err
 }
 func (s *Store) Register(ctx context.Context, worker, session string) error {
@@ -105,23 +115,26 @@ func (s *Store) Disconnect(ctx context.Context, session string) error {
 	return err
 }
 
-const jobColumns = `id::text,state,image,command,timeout_seconds,max_attempts,current_attempt_id::text,fencing_token,attempt_count,pipeline_id::text,job_key`
+const jobColumns = `id::text,state,image,command,timeout_seconds,max_attempts,current_attempt_id::text,fencing_token,attempt_count,pipeline_id::text,job_key,trace_parent,created_at,finished_at,retry_available_at`
 
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var j domain.Job
 	var argv []byte
-	err := row.Scan(&j.ID, &j.State, &j.Image, &argv, &j.TimeoutSeconds, &j.MaxAttempts, &j.CurrentAttemptID, &j.FencingToken, &j.AttemptCount, &j.PipelineID, &j.Key)
+	err := row.Scan(&j.ID, &j.State, &j.Image, &argv, &j.TimeoutSeconds, &j.MaxAttempts, &j.CurrentAttemptID, &j.FencingToken, &j.AttemptCount, &j.PipelineID, &j.Key, &j.TraceParent, &j.CreatedAt, &j.FinishedAt, &j.RetryAvailableAt)
 	if err == nil {
 		err = json.Unmarshal(argv, &j.Command)
 	}
 	return j, err
 }
 
-const attemptColumns = `a.id::text,a.job_id::text,a.attempt_number,a.fencing_token,a.worker_session_id::text,a.state,a.lease_expires_at,a.exit_code,a.failure_kind,a.failure_detail,w.worker_id,a.execution_deadline_at`
+const attemptColumns = `a.id::text,a.job_id::text,a.attempt_number,a.fencing_token,a.worker_session_id::text,a.state,a.lease_expires_at,a.exit_code,a.failure_kind,a.failure_detail,w.worker_id,a.execution_deadline_at,a.trace_parent,a.assigned_at,a.started_at,a.finished_at`
 
 func scanAttempt(row pgx.Row) (domain.Attempt, error) {
 	var a domain.Attempt
-	err := row.Scan(&a.AttemptID, &a.JobID, &a.Number, &a.FencingToken, &a.SessionID, &a.State, &a.LeaseExpiresAt, &a.ExitCode, &a.FailureKind, &a.FailureDetail, &a.WorkerID, &a.ExecutionDeadline)
+	err := row.Scan(&a.AttemptID, &a.JobID, &a.Number, &a.FencingToken, &a.SessionID, &a.State, &a.LeaseExpiresAt, &a.ExitCode, &a.FailureKind, &a.FailureDetail, &a.WorkerID, &a.ExecutionDeadline, &a.TraceParent, &a.AssignedAt, &a.StartedAt, &a.FinishedAt)
+	if sc := trace.SpanContextFromContext(observability.Parent(context.Background(), a.TraceParent)); sc.IsValid() {
+		a.TraceID = sc.TraceID().String()
+	}
 	return a, err
 }
 func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
@@ -195,6 +208,7 @@ func (s *Store) Schedule(ctx context.Context, connected []string) (*domain.Assig
 	return nil, nil
 }
 func (s *Store) scheduleJob(ctx context.Context, id string, connected []string) (*domain.Assignment, error) {
+	started := time.Now()
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -212,7 +226,12 @@ func (s *Store) scheduleJob(ctx context.Context, id string, connected []string) 
 		return nil, err
 	}
 	var session, worker string
+	ctx, claimSpan := observability.Start(observability.Parent(ctx, j.TraceParent), "scheduler.claim_job", attribute.String("job_id", j.ID))
+	defer claimSpan.End()
+	claimSpan.SetAttributes(attribute.Bool("committed", false))
+	_, selectSpan := observability.Start(ctx, "scheduler.select_worker")
 	err = tx.QueryRow(ctx, `SELECT id::text,worker_id FROM worker_sessions WHERE state='ONLINE' AND connected AND id::text=ANY($1::text[]) AND last_seen_at>clock_timestamp()-$2*interval '1 millisecond' AND active_slots<capacity_slots ORDER BY active_slots,last_assignment_at NULLS FIRST,worker_id,id FOR UPDATE SKIP LOCKED LIMIT 1`, connected, s.Offline.Milliseconds()).Scan(&session, &worker)
+	observability.End(selectSpan, err)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -220,7 +239,12 @@ func (s *Store) scheduleJob(ctx context.Context, id string, connected []string) 
 		return nil, err
 	}
 	a := domain.Attempt{Identity: domain.Identity{AttemptID: uuid.NewString(), FencingToken: j.FencingToken + 1, SessionID: session}, JobID: j.ID, Number: j.AttemptCount + 1, WorkerID: worker, State: "ASSIGNED"}
-	err = tx.QueryRow(ctx, `INSERT INTO job_attempts(id,job_id,attempt_number,fencing_token,worker_session_id,state,lease_expires_at) VALUES($1,$2,$3,$4,$5,'ASSIGNED',clock_timestamp()+$6*interval '1 millisecond') RETURNING lease_expires_at`, a.AttemptID, j.ID, a.Number, a.FencingToken, session, s.Lease.Milliseconds()).Scan(&a.LeaseExpiresAt)
+	claimSpan.SetAttributes(observability.Attrs(j, a)...)
+	ctx, attemptSpan := observability.Start(ctx, "scheduler.create_attempt", observability.Attrs(j, a)...)
+	defer attemptSpan.End()
+	attemptSpan.SetAttributes(attribute.Bool("committed", false))
+	a.TraceParent = observability.Carrier(ctx)
+	err = tx.QueryRow(ctx, `INSERT INTO job_attempts(id,job_id,attempt_number,fencing_token,worker_session_id,state,lease_expires_at,trace_parent,queue_wait_seconds) VALUES($1,$2,$3,$4,$5,'ASSIGNED',clock_timestamp()+$6*interval '1 millisecond',$7,(SELECT greatest(0,extract(epoch FROM (clock_timestamp()-coalesce(last_queued_at,created_at)))) FROM jobs WHERE id=$2)) RETURNING lease_expires_at`, a.AttemptID, j.ID, a.Number, a.FencingToken, session, s.Lease.Milliseconds(), a.TraceParent).Scan(&a.LeaseExpiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +261,12 @@ func (s *Store) scheduleJob(ctx context.Context, id string, connected []string) 
 	j.CurrentAttemptID = &a.AttemptID
 	j.FencingToken = a.FencingToken
 	j.AttemptCount = a.Number
+	claimSpan.SetAttributes(attribute.Bool("committed", true))
+	attemptSpan.SetAttributes(attribute.Bool("committed", true))
+	if s.Metrics != nil {
+		s.Metrics.Assignment.Observe(time.Since(started).Seconds())
+	}
+	slog.InfoContext(ctx, "attempt committed", observability.Fields(ctx, j, a)...)
 	return &domain.Assignment{Job: j, Attempt: a}, nil
 }
 
@@ -283,6 +313,13 @@ func (s *Store) Advance(ctx context.Context, id domain.Identity, action string) 
 	if err != nil {
 		return 0, err
 	}
+	name := "controlplane." + action
+	if action == "renew" {
+		name = "lease.renew"
+	}
+	ctx, span := observability.Start(observability.Continue(ctx, a.TraceParent), name, observability.Attrs(j, a)...)
+	defer span.End()
+	span.SetAttributes(attribute.Bool("committed", false))
 	if !domain.Owns(j, a, id, now) || session != "ONLINE" {
 		return 0, domain.ErrStale
 	}
@@ -317,9 +354,15 @@ func (s *Store) Advance(ctx context.Context, id domain.Identity, action string) 
 	if err = tx.Commit(ctx); err != nil {
 		return 0, err
 	}
+	span.SetAttributes(attribute.Bool("committed", true))
 	return s.Lease, nil
 }
-func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Result) (bool, error) {
+func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Result) (duplicate bool, completionErr error) {
+	defer func() {
+		if s.Metrics != nil && errors.Is(completionErr, domain.ErrStale) {
+			s.Metrics.Stale.Inc()
+		}
+	}()
 	if err := r.Validate(); err != nil {
 		return false, err
 	}
@@ -333,6 +376,23 @@ func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Resul
 	if err != nil {
 		return false, err
 	}
+	ctx, span := observability.Start(observability.Continue(ctx, a.TraceParent), "controlplane.complete_attempt", observability.Attrs(j, a)...)
+	defer func() {
+		if completionErr != nil {
+			reason := "DATABASE_ERROR"
+			for _, category := range []error{domain.ErrStale, domain.ErrCancelled, domain.ErrConflict, domain.ErrTimeout, domain.ErrSession} {
+				if errors.Is(completionErr, category) {
+					reason = category.Error()
+					break
+				}
+			}
+			fields := observability.Fields(ctx, j, a)
+			fields = append(fields, "rejection", reason, "requested_fencing_token", id.FencingToken)
+			slog.WarnContext(ctx, "attempt result rejected", fields...)
+		}
+		observability.End(span, completionErr)
+	}()
+	span.SetAttributes(attribute.Bool("committed", false), attribute.String("result", r.State), attribute.String("failure_kind", r.FailureKind))
 	// An exact duplicate of the current winner is acknowledged without mutating anything.
 	if j.CurrentAttemptID == nil || *j.CurrentAttemptID != id.AttemptID || j.FencingToken != id.FencingToken || a.FencingToken != id.FencingToken || a.SessionID != id.SessionID {
 		return false, domain.ErrStale
@@ -342,6 +402,7 @@ func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Resul
 			return false, domain.ErrStale
 		}
 		if a.State == r.State && a.ExitCode != nil && *a.ExitCode == r.ExitCode && a.FailureKind == r.FailureKind && a.FailureDetail == r.Detail {
+			span.SetAttributes(attribute.Bool("duplicate", true))
 			return true, nil
 		}
 		return false, domain.ErrConflict
@@ -361,7 +422,14 @@ func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Resul
 	if err = s.finish(ctx, tx, j, a, r); err != nil {
 		return false, err
 	}
-	return false, tx.Commit(ctx)
+	err = tx.Commit(ctx)
+	span.SetAttributes(attribute.Bool("committed", err == nil))
+	if err == nil {
+		fields := observability.Fields(ctx, j, a)
+		fields = append(fields, "result", r.State, "failure_kind", r.FailureKind)
+		slog.InfoContext(ctx, "attempt finalized", fields...)
+	}
+	return false, err
 }
 func (s *Store) finish(ctx context.Context, tx pgx.Tx, j domain.Job, a domain.Attempt, r domain.Result) error {
 	if _, err := tx.Exec(ctx, `UPDATE job_attempts SET state=$2,exit_code=$3,failure_kind=$4,failure_detail=$5,finished_at=clock_timestamp() WHERE id=$1`, a.AttemptID, r.State, r.ExitCode, r.FailureKind, domain.BoundedDetail(r.Detail)); err != nil {
@@ -371,7 +439,13 @@ func (s *Store) finish(ctx context.Context, tx pgx.Tx, j domain.Job, a domain.At
 	if j.State == "CANCELLING" {
 		next = "CANCELLED"
 	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET state=$2,retry_available_at=CASE WHEN $2='RETRY_WAIT' THEN clock_timestamp()+$3*interval '1 millisecond' ELSE NULL END,finished_at=CASE WHEN $2 IN ('SUCCEEDED','FAILED','CANCELLED') THEN clock_timestamp() ELSE NULL END WHERE id=$1`, j.ID, next, domain.RetryDelay(a.Number, s.RetryBase).Milliseconds()); err != nil {
+	if next == "RETRY_WAIT" {
+		var spanCtx context.Context
+		spanCtx, retrySpan := observability.Start(ctx, "recovery.retry_job", attribute.String("reason", r.FailureKind), attribute.Int("next_attempt_number", a.Number+1))
+		ctx = spanCtx
+		defer retrySpan.End()
+	}
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET state=$2,retry_available_at=CASE WHEN $2='RETRY_WAIT' THEN clock_timestamp()+$3*interval '1 millisecond' ELSE NULL END,finished_at=CASE WHEN $2 IN ('SUCCEEDED','FAILED','CANCELLED') THEN clock_timestamp() ELSE NULL END,trace_parent=$4 WHERE id=$1`, j.ID, next, domain.RetryDelay(a.Number, s.RetryBase).Milliseconds(), observability.Carrier(ctx)); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `UPDATE worker_sessions SET active_slots=active_slots-1 WHERE id=$1`, a.SessionID)
@@ -385,6 +459,9 @@ func (s *Store) finish(ctx context.Context, tx pgx.Tx, j domain.Job, a domain.At
 // ownership or capacity: that waits for a valid stopped-execution ACK or expiry.
 // A committed cancellation request prevents a racing successful completion.
 func (s *Store) Cancel(ctx context.Context, jobID string) (*domain.Identity, error) {
+	ctx, span := observability.Start(ctx, "job.cancel", attribute.String("job_id", jobID))
+	defer span.End()
+	span.SetAttributes(attribute.Bool("committed", false))
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -407,6 +484,13 @@ func (s *Store) Cancel(ctx context.Context, jobID string) (*domain.Identity, err
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	span.SetAttributes(attribute.Bool("committed", true))
+	fields := []any{"job_id", jobID}
+	if pipelineID != nil {
+		fields = append(fields, "pipeline_id", *pipelineID)
+	}
+	fields = append(fields, observability.TraceFields(ctx)...)
+	slog.InfoContext(ctx, "job cancellation committed", fields...)
 	return id, nil
 }
 func cancelJob(ctx context.Context, tx pgx.Tx, jobID string) (*domain.Identity, error) {
@@ -510,6 +594,9 @@ func (s *Store) recoverJob(ctx context.Context, id string) (bool, error) {
 	if !domain.Active(a.State) || now.Before(a.LeaseExpiresAt) {
 		return false, nil
 	}
+	ctx, span := observability.Start(observability.Parent(ctx, a.TraceParent), "recovery.expire_attempt", observability.Attrs(j, a)...)
+	defer span.End()
+	span.SetAttributes(attribute.Bool("committed", false))
 	r := domain.Result{State: "LOST", ExitCode: -1, FailureKind: "LEASE_EXPIRED", Detail: "execution lease expired"}
 	// A delayed scanner must classify the first expired authority, not turn
 	// an earlier infrastructure lease loss into workload failure just because
@@ -520,7 +607,14 @@ func (s *Store) recoverJob(ctx context.Context, id string) (bool, error) {
 	if err = s.finish(ctx, tx, j, a, r); err != nil {
 		return false, err
 	}
-	return true, tx.Commit(ctx)
+	err = tx.Commit(ctx)
+	span.SetAttributes(attribute.Bool("committed", err == nil), attribute.String("result", r.State), attribute.String("failure_kind", r.FailureKind))
+	if err == nil {
+		fields := observability.Fields(ctx, j, a)
+		fields = append(fields, "result", r.State, "failure_kind", r.FailureKind)
+		slog.InfoContext(ctx, "expired attempt recovered", fields...)
+	}
+	return true, err
 }
 func timedOut(a domain.Attempt, now time.Time) bool {
 	return a.ExecutionDeadline != nil && !now.Before(*a.ExecutionDeadline)
@@ -569,7 +663,7 @@ func (s *Store) requeueJob(ctx context.Context, id string) error {
 	if err != nil || !locked {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE jobs SET state='QUEUED' WHERE id=$1 AND state='RETRY_WAIT' AND retry_available_at<=clock_timestamp()`, id); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE jobs SET state='QUEUED',last_queued_at=clock_timestamp() WHERE id=$1 AND state='RETRY_WAIT' AND retry_available_at<=clock_timestamp()`, id); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -595,17 +689,20 @@ func (s *Store) ExpiredExecutions(ctx context.Context) ([]domain.Identity, error
 }
 
 type Session struct {
-	ID          string    `json:"worker_session_id"`
-	WorkerID    string    `json:"worker_id"`
-	State       string    `json:"state"`
-	Connected   bool      `json:"connected"`
-	ActiveSlots int       `json:"active_slots"`
-	Capacity    int       `json:"capacity_slots"`
-	LastSeen    time.Time `json:"last_seen_at"`
+	StartedAt      time.Time  `json:"started_at"`
+	DisconnectedAt *time.Time `json:"disconnected_at"`
+	Current        bool       `json:"current"`
+	ID             string     `json:"worker_session_id"`
+	WorkerID       string     `json:"worker_id"`
+	State          string     `json:"state"`
+	Connected      bool       `json:"connected"`
+	ActiveSlots    int        `json:"active_slots"`
+	Capacity       int        `json:"capacity_slots"`
+	LastSeen       time.Time  `json:"last_seen_at"`
 }
 
 func (s *Store) Sessions(ctx context.Context) ([]Session, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id::text,worker_id,state,connected,active_slots,capacity_slots,last_seen_at FROM worker_sessions ORDER BY worker_id,started_at`)
+	rows, err := s.Pool.Query(ctx, `SELECT id::text,worker_id,state,connected,active_slots,capacity_slots,last_seen_at,started_at,disconnected_at,(row_number() OVER(PARTITION BY worker_id ORDER BY started_at DESC,id DESC)=1) FROM worker_sessions ORDER BY worker_id,started_at,id`)
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +710,7 @@ func (s *Store) Sessions(ctx context.Context) ([]Session, error) {
 	out := []Session{}
 	for rows.Next() {
 		var v Session
-		if err = rows.Scan(&v.ID, &v.WorkerID, &v.State, &v.Connected, &v.ActiveSlots, &v.Capacity, &v.LastSeen); err != nil {
+		if err = rows.Scan(&v.ID, &v.WorkerID, &v.State, &v.Connected, &v.ActiveSlots, &v.Capacity, &v.LastSeen, &v.StartedAt, &v.DisconnectedAt, &v.Current); err != nil {
 			return nil, err
 		}
 		out = append(out, v)

@@ -192,6 +192,7 @@ type AttemptResult struct {
 	ExitCode      int32                  `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
 	FailureKind   string                 `protobuf:"bytes,4,opt,name=failure_kind,json=failureKind,proto3" json:"failure_kind,omitempty"`
 	Detail        string                 `protobuf:"bytes,5,opt,name=detail,proto3" json:"detail,omitempty"`
+	TraceParent   string                 `protobuf:"bytes,6,opt,name=trace_parent,json=traceParent,proto3" json:"trace_parent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -257,6 +258,13 @@ func (x *AttemptResult) GetFailureKind() string {
 func (x *AttemptResult) GetDetail() string {
 	if x != nil {
 		return x.Detail
+	}
+	return ""
+}
+
+func (x *AttemptResult) GetTraceParent() string {
+	if x != nil {
+		return x.TraceParent
 	}
 	return ""
 }
@@ -366,7 +374,8 @@ func (x *LeaseRenewRequest) GetRequestId() uint64 {
 }
 
 type WorkerMessage struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	TraceParent string                 `protobuf:"bytes,9,opt,name=trace_parent,json=traceParent,proto3" json:"trace_parent,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*WorkerMessage_Register
@@ -410,6 +419,13 @@ func (x *WorkerMessage) ProtoReflect() protoreflect.Message {
 // Deprecated: Use WorkerMessage.ProtoReflect.Descriptor instead.
 func (*WorkerMessage) Descriptor() ([]byte, []int) {
 	return file_forgegrid_v1_worker_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *WorkerMessage) GetTraceParent() string {
+	if x != nil {
+		return x.TraceParent
+	}
+	return ""
 }
 
 func (x *WorkerMessage) GetBody() isWorkerMessage_Body {
@@ -603,6 +619,8 @@ type RunAttempt struct {
 	Image          string                 `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`
 	Command        []string               `protobuf:"bytes,5,rep,name=command,proto3" json:"command,omitempty"`
 	TimeoutSeconds int32                  `protobuf:"varint,6,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	TraceParent    string                 `protobuf:"bytes,7,opt,name=trace_parent,json=traceParent,proto3" json:"trace_parent,omitempty"`
+	PipelineId     string                 `protobuf:"bytes,8,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -677,6 +695,20 @@ func (x *RunAttempt) GetTimeoutSeconds() int32 {
 		return x.TimeoutSeconds
 	}
 	return 0
+}
+
+func (x *RunAttempt) GetTraceParent() string {
+	if x != nil {
+		return x.TraceParent
+	}
+	return ""
+}
+
+func (x *RunAttempt) GetPipelineId() string {
+	if x != nil {
+		return x.PipelineId
+	}
+	return ""
 }
 
 // The worker computes its monotonic deadline from request-send time, not ACK-receive time.
@@ -1127,21 +1159,23 @@ const file_forgegrid_v1_worker_proto_rawDesc = "" +
 	"\x11worker_session_id\x18\x02 \x01(\tR\x0fworkerSessionId\x12%\n" +
 	"\x0ecapacity_slots\x18\x03 \x01(\x05R\rcapacitySlots\"7\n" +
 	"\tHeartbeat\x12*\n" +
-	"\x11worker_session_id\x18\x01 \x01(\tR\x0fworkerSessionId\"\xb8\x01\n" +
+	"\x11worker_session_id\x18\x01 \x01(\tR\x0fworkerSessionId\"\xdb\x01\n" +
 	"\rAttemptResult\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x1b\n" +
 	"\texit_code\x18\x03 \x01(\x05R\bexitCode\x12!\n" +
 	"\ffailure_kind\x18\x04 \x01(\tR\vfailureKind\x12\x16\n" +
-	"\x06detail\x18\x05 \x01(\tR\x06detail\"g\n" +
+	"\x06detail\x18\x05 \x01(\tR\x06detail\x12!\n" +
+	"\ftrace_parent\x18\x06 \x01(\tR\vtraceParent\"g\n" +
 	"\x12AssignmentRejected\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"m\n" +
 	"\x11LeaseRenewRequest\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x02 \x01(\x04R\trequestId\"\xdc\x04\n" +
-	"\rWorkerMessage\x124\n" +
+	"request_id\x18\x02 \x01(\x04R\trequestId\"\xff\x04\n" +
+	"\rWorkerMessage\x12!\n" +
+	"\ftrace_parent\x18\t \x01(\tR\vtraceParent\x124\n" +
 	"\bregister\x18\x01 \x01(\v2\x16.forgegrid.v1.RegisterH\x00R\bregister\x127\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x17.forgegrid.v1.HeartbeatH\x00R\theartbeat\x12P\n" +
 	"\x13assignment_accepted\x18\x03 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityH\x00R\x12assignmentAccepted\x12S\n" +
@@ -1154,7 +1188,7 @@ const file_forgegrid_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"Registered\x12*\n" +
 	"\x11worker_session_id\x18\x01 \x01(\tR\x0fworkerSessionId\x122\n" +
-	"\x15heartbeat_interval_ms\x18\x02 \x01(\x03R\x13heartbeatIntervalMs\"\xde\x01\n" +
+	"\x15heartbeat_interval_ms\x18\x02 \x01(\x03R\x13heartbeatIntervalMs\"\xa2\x02\n" +
 	"\n" +
 	"RunAttempt\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x15\n" +
@@ -1162,7 +1196,10 @@ const file_forgegrid_v1_worker_proto_rawDesc = "" +
 	"\x0eattempt_number\x18\x03 \x01(\x05R\rattemptNumber\x12\x14\n" +
 	"\x05image\x18\x04 \x01(\tR\x05image\x12\x18\n" +
 	"\acommand\x18\x05 \x03(\tR\acommand\x12'\n" +
-	"\x0ftimeout_seconds\x18\x06 \x01(\x05R\x0etimeoutSeconds\"\xaf\x01\n" +
+	"\x0ftimeout_seconds\x18\x06 \x01(\x05R\x0etimeoutSeconds\x12!\n" +
+	"\ftrace_parent\x18\a \x01(\tR\vtraceParent\x12\x1f\n" +
+	"\vpipeline_id\x18\b \x01(\tR\n" +
+	"pipelineId\"\xaf\x01\n" +
 	"\fLeaseRenewed\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x1d\n" +
 	"\n" +

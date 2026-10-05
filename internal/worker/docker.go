@@ -13,9 +13,14 @@ import (
 
 	pb "forgegrid/gen/go/forgegrid/v1"
 	"forgegrid/internal/domain"
+	"forgegrid/internal/observability"
 )
 
-func dockerOutput(ctx context.Context, args ...string) (string, error) {
+func dockerOutput(ctx context.Context, args ...string) (output string, resultErr error) {
+	if args[0] == "create" || args[0] == "start" || args[0] == "wait" {
+		_, span := observability.Start(ctx, "docker."+args[0])
+		defer func() { observability.End(span, resultErr) }()
+	}
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("docker %s: %w: %s", args[0], err, domain.BoundedDetail(string(out)))
@@ -72,7 +77,10 @@ func execute(ctx context.Context, worker string, a *pb.RunAttempt, emit func(str
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if _, err := dockerOutput(cleanup, "rm", "-f", name); err != nil {
-			slog.Warn("container cleanup failed", "container", name, "error", err)
+			j, attempt := assignmentFields(a, worker)
+			fields := observability.Fields(ctx, j, attempt)
+			fields = append(fields, "failure_kind", "DOCKER_CLEANUP_ERROR")
+			slog.WarnContext(ctx, "container cleanup failed", fields...)
 		}
 	}()
 	if _, err := dockerOutput(ctx, "image", "inspect", a.Image); err != nil {

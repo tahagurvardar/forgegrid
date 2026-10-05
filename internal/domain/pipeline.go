@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 type PipelineJobSpec struct {
@@ -14,9 +15,12 @@ type PipelineSpec struct {
 	Jobs []PipelineJobSpec `json:"jobs"`
 }
 type Pipeline struct {
-	ID    string `json:"id"`
-	State string `json:"state"`
-	Jobs  []Job  `json:"jobs"`
+	CreatedAt  time.Time  `json:"created_at"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	ID         string     `json:"id"`
+	State      string     `json:"state"`
+	Jobs       []Job      `json:"jobs"`
 }
 
 func (s Spec) WithDefaults() Spec {

@@ -1513,6 +1513,8 @@ Any container surviving the dead agent is stale and cannot produce an authoritat
 
 # 45. Observability
 
+Milestone 4 implements this observation layer without adding it to coordination authority. See [observability-audit.md](observability-audit.md) for trace propagation, committed metric snapshots, cardinality, exporter isolation, and evidence. Frontend presentation remains deferred.
+
 Prometheus metrics should include:
 
 ```text
@@ -1552,6 +1554,8 @@ Those belong in traces and structured logs.
 ---
 
 # 46. Distributed Tracing
+
+Implementation persists bounded W3C traceparent metadata for asynchronous claims/retries and propagates per-attempt context over gRPC. Requests end with responses; stream lifetime is not execution lifetime. Diagnostic queue timing measures eligible queue wait independently of blocked/backoff time.
 
 Important spans:
 
@@ -2131,3 +2135,9 @@ What does ForgeGrid explicitly not guarantee?
 ```
 
 If all of those answers are visible in code, tests, database transitions, traces and documentation, ForgeGrid has achieved its purpose.
+
+---
+
+# Milestone 5 implementation note
+
+The operational React/TypeScript/Vite console implements the architecture's inspection layer: static DAGs, persisted job/attempt/session state, recovery chronology and resumable SSE logs. Read-only API additions expose existing PostgreSQL metadata; no new coordination authority, ownership transition, gRPC service or schema is introduced. Browser clocks, polling, trace availability and connection state never grant execution authority. See [the operational console audit](operational-console-audit.md) for routes, snapshot boundaries, evidence and intentionally unsupported states.

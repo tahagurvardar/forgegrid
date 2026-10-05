@@ -13,7 +13,9 @@ try {
         @{ key='test'; image='alpine:3.22'; command=@('sleep','20'); dependencies=@('build'); timeout_seconds=60; max_attempts=2 },
         @{ key='package'; image='alpine:3.22'; command=@('echo','package'); dependencies=@('test'); timeout_seconds=60; max_attempts=2 }
     ) } | ConvertTo-Json -Depth 8
-    $submitted = Invoke-RestMethod "$BaseUrl/api/v1/pipelines" -Method Post -ContentType 'application/json' -Body $payload
+    $response = Invoke-WebRequest "$BaseUrl/api/v1/pipelines" -Method Post -ContentType 'application/json' -Body $payload
+    $submitted = $response.Content | ConvertFrom-Json
+    Write-Host "PIPELINE_RECOVERY_TRACE_ID=$($response.Headers['X-ForgeGrid-Trace-ID'])"
     $path = "$BaseUrl/api/v1/pipelines/$($submitted.id)"
     Wait-Until { @((Invoke-RestMethod $path).jobs | Where-Object { $_.key -eq 'test' -and $_.state -eq 'RUNNING' }).Count -eq 1 }
     $p = Invoke-RestMethod $path

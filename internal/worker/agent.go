@@ -9,12 +9,15 @@ import (
 
 	pb "forgegrid/gen/go/forgegrid/v1"
 	"forgegrid/internal/domain"
+	"forgegrid/internal/observability"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 type activeAttempt struct {
+	traceContext    context.Context
 	assignment      *pb.RunAttempt
 	deadline        time.Time
 	initialDeadline time.Time
@@ -27,6 +30,16 @@ type activeAttempt struct {
 	lost            bool
 	cancelRequested bool
 	stopState       string
+}
+
+var Metrics *observability.Metrics // Set once before the agent starts; never coordination authority.
+func assignmentFields(a *pb.RunAttempt, worker string) (domain.Job, domain.Attempt) {
+	j := domain.Job{ID: a.JobId}
+	if a.PipelineId != "" {
+		j.PipelineID = &a.PipelineId
+	}
+	attempt := domain.Attempt{Identity: domain.Identity{AttemptID: a.Identity.AttemptId, SessionID: a.Identity.WorkerSessionId, FencingToken: a.Identity.FencingToken}, Number: int(a.AttemptNumber), WorkerID: worker}
+	return j, attempt
 }
 
 func same(a, b *pb.AttemptIdentity) bool {
@@ -130,7 +143,9 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 		request++
 		active.pending = request
 		active.sent = time.Now()
-		if !send(&pb.WorkerMessage{Body: &pb.WorkerMessage_LeaseRenewRequest{LeaseRenewRequest: &pb.LeaseRenewRequest{Identity: active.assignment.Identity, RequestId: request}}}) {
+		renewCtx, span := observability.Start(active.traceContext, "worker.request_lease_renewal")
+		defer span.End()
+		if !send(&pb.WorkerMessage{TraceParent: observability.Carrier(renewCtx), Body: &pb.WorkerMessage_LeaseRenewRequest{LeaseRenewRequest: &pb.LeaseRenewRequest{Identity: active.assignment.Identity, RequestId: request}}}) {
 			disconnected = errors.New("control queue full")
 		}
 	}
@@ -173,7 +188,11 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 			}
 			if expired && !active.lost {
 				active.lost = true
-				slog.Warn("local execution authority expired", "attempt_id", active.assignment.Identity.AttemptId)
+				if Metrics != nil {
+					Metrics.WorkerLeaseLoss.Inc()
+				}
+				j, a := assignmentFields(active.assignment, worker)
+				slog.WarnContext(active.traceContext, "local execution authority expired", observability.Fields(active.traceContext, j, a)...)
 				if active.cancel != nil {
 					active.cancel()
 				} else {
@@ -182,15 +201,19 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 			}
 			if active.result != nil && !active.lost && disconnected == nil && now.Sub(active.lastReport) > time.Second {
 				active.lastReport = now
-				msg := &pb.WorkerMessage{}
+				reportCtx, reportSpan := observability.Start(active.traceContext, "worker.report_completion")
+				msg := &pb.WorkerMessage{TraceParent: observability.Carrier(reportCtx)}
+				reportResult := proto.Clone(active.result).(*pb.AttemptResult)
+				reportResult.TraceParent = msg.TraceParent
 				if active.result.State == "SUCCEEDED" {
-					msg.Body = &pb.WorkerMessage_AttemptCompleted{AttemptCompleted: active.result}
+					msg.Body = &pb.WorkerMessage_AttemptCompleted{AttemptCompleted: reportResult}
 				} else {
-					msg.Body = &pb.WorkerMessage_AttemptFailed{AttemptFailed: active.result}
+					msg.Body = &pb.WorkerMessage_AttemptFailed{AttemptFailed: reportResult}
 				}
 				if !send(msg) {
 					disconnected = errors.New("control queue full")
 				}
+				reportSpan.End()
 			}
 		case result := <-results:
 			if active == nil {
@@ -204,7 +227,10 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 				result = stoppedResult(active.stopState)
 			}
 			active.result = &pb.AttemptResult{Identity: active.assignment.Identity, State: result.State, ExitCode: result.ExitCode, FailureKind: result.FailureKind, Detail: domain.BoundedDetail(result.Detail)}
-			slog.Info("execution finished", "attempt_id", active.assignment.Identity.AttemptId, "state", result.State, "exit_code", result.ExitCode)
+			j, a := assignmentFields(active.assignment, worker)
+			fields := observability.Fields(active.traceContext, j, a)
+			fields = append(fields, "result", result.State, "failure_kind", result.FailureKind, "exit_code", result.ExitCode)
+			slog.InfoContext(active.traceContext, "execution finished", fields...)
 		case msg := <-incoming:
 			switch {
 			case msg.GetRunAttempt() != nil:
@@ -224,8 +250,13 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 					// reservation. Execution and log draining already finished;
 					// a delayed old ACK must not consume the new attempt's retry.
 				}
-				active = &activeAttempt{assignment: a, initialDeadline: time.Now().Add(5 * time.Second)}
-				send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AssignmentAccepted{AssignmentAccepted: a.Identity}})
+				j, attempt := assignmentFields(a, worker)
+				receiveCtx, receiveSpan := observability.Start(observability.Parent(ctx, a.TraceParent), "worker.receive_assignment", observability.Attrs(j, attempt)...)
+				active = &activeAttempt{assignment: a, initialDeadline: time.Now().Add(5 * time.Second), traceContext: receiveCtx}
+				acceptCtx, acceptSpan := observability.Start(receiveCtx, "worker.accept_assignment")
+				send(&pb.WorkerMessage{TraceParent: observability.Carrier(acceptCtx), Body: &pb.WorkerMessage_AssignmentAccepted{AssignmentAccepted: a.Identity}})
+				acceptSpan.End()
+				receiveSpan.End()
 				requestRenew()
 			case msg.GetLeaseRenewed() != nil:
 				ack := msg.GetLeaseRenewed()
@@ -251,11 +282,19 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 					if payloadLimit := time.Now().Add(time.Duration(active.assignment.TimeoutSeconds) * time.Second); payloadLimit.Before(executionDeadline) {
 						executionDeadline = payloadLimit
 					}
-					runctx, stop := context.WithDeadline(ctx, executionDeadline)
+					runctx, stop := context.WithDeadline(active.traceContext, executionDeadline)
 					active.cancel = stop
 					a := active.assignment
 					go func() {
-						r := execute(runctx, pb.NewWorkerLogsClient(logConn), worker, a, func() { send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AttemptStarted{AttemptStarted: a.Identity}}) })
+						j, attempt := assignmentFields(a, worker)
+						execCtx, span := observability.Start(runctx, "worker.execute_attempt", observability.Attrs(j, attempt)...)
+						r := execute(execCtx, pb.NewWorkerLogsClient(logConn), worker, a, func() {
+							send(&pb.WorkerMessage{TraceParent: observability.Carrier(execCtx), Body: &pb.WorkerMessage_AttemptStarted{AttemptStarted: a.Identity}})
+						})
+						span.End()
+						if Metrics != nil {
+							Metrics.WorkerExecutions.WithLabelValues(observability.Result(r.State)).Inc()
+						}
 						stop()
 						results <- r
 					}()

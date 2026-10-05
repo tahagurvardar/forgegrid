@@ -8,14 +8,17 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	pb "forgegrid/gen/go/forgegrid/v1"
 	"forgegrid/internal/domain"
+	"forgegrid/internal/observability"
 	"forgegrid/internal/store/postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -153,6 +156,7 @@ func (s *Server) Connect(stream pb.WorkerControl_ConnectServer) error {
 	}
 }
 func (s *Server) handle(ctx context.Context, session string, msg *pb.WorkerMessage) error {
+	ctx = observability.Parent(ctx, msg.TraceParent)
 	if h := msg.GetHeartbeat(); h != nil {
 		if h.WorkerSessionId != session {
 			return status.Error(codes.PermissionDenied, "session mismatch")
@@ -227,6 +231,7 @@ func (s *Server) ReportResult(ctx context.Context, r *pb.AttemptResult) (*pb.Res
 	if r == nil {
 		return nil, status.Error(codes.InvalidArgument, "result required")
 	}
+	ctx = observability.Continue(ctx, r.TraceParent)
 	id, err := identity(r.Identity)
 	if err != nil {
 		return nil, err
@@ -243,7 +248,7 @@ func (s *Server) ReportResult(ctx context.Context, r *pb.AttemptResult) (*pb.Res
 		}
 		ack.Error = err.Error()
 	}
-	slog.Info("attempt result", "attempt_id", id.AttemptID, "fencing_token", id.FencingToken, "worker_session_id", id.SessionID, "accepted", ack.Accepted, "duplicate", dup, "error", ack.Error)
+	// Store logs accepted/rejected transitions with complete persisted correlation.
 	return ack, nil
 }
 
@@ -323,9 +328,7 @@ func (s *Server) Run(ctx context.Context) {
 			if a == nil {
 				break
 			}
-			msg := &pb.ControlMessage{Body: &pb.ControlMessage_RunAttempt{RunAttempt: &pb.RunAttempt{Identity: wire(a.Attempt.Identity), JobId: a.Job.ID, AttemptNumber: int32(a.Attempt.Number), Image: a.Job.Image, Command: a.Job.Command, TimeoutSeconds: int32(a.Job.TimeoutSeconds)}}}
-			delivered := s.send(a.Attempt.SessionID, msg)
-			slog.Info("attempt assigned", "job_id", a.Job.ID, "attempt_id", a.Attempt.AttemptID, "worker_id", a.Attempt.WorkerID, "fencing_token", a.Attempt.FencingToken, "delivered", delivered)
+			s.dispatch(iteration, a)
 		}
 		cancel()
 	}
@@ -339,7 +342,11 @@ func jsonResponse(w http.ResponseWriter, code int, v any) {
 }
 func (s *Server) HTTP() http.Handler {
 	mux := http.NewServeMux()
+	if s.Store.Metrics != nil {
+		mux.Handle("GET /metrics", s.Store.Metrics.Handler())
+	}
 	s.pipelineRoutes(mux)
+	s.inspectionRoutes(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := s.Store.Pool.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", 503)
@@ -424,5 +431,29 @@ func (s *Server) HTTP() http.Handler {
 		}
 		jsonResponse(w, 200, logs)
 	})
-	return http.TimeoutHandler(mux, 10*time.Second, "request timed out")
+	streamMux := http.NewServeMux()
+	streamMux.HandleFunc("GET /api/v1/attempts/{id}/logs/stream", s.streamLogs)
+	timed := http.TimeoutHandler(mux, 10*time.Second, "request timed out")
+	return observability.HTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/logs/stream") {
+			streamMux.ServeHTTP(w, r)
+			return
+		}
+		timed.ServeHTTP(w, r)
+	}))
+}
+
+func (s *Server) dispatch(ctx context.Context, a *domain.Assignment) bool {
+	ctx, span := observability.Start(observability.Parent(ctx, a.Attempt.TraceParent), "grpc.dispatch_assignment", observability.Attrs(a.Job, a.Attempt)...)
+	defer span.End()
+	pipelineID := ""
+	if a.Job.PipelineID != nil {
+		pipelineID = *a.Job.PipelineID
+	}
+	delivered := s.send(a.Attempt.SessionID, &pb.ControlMessage{Body: &pb.ControlMessage_RunAttempt{RunAttempt: &pb.RunAttempt{Identity: wire(a.Attempt.Identity), JobId: a.Job.ID, AttemptNumber: int32(a.Attempt.Number), Image: a.Job.Image, Command: a.Job.Command, TimeoutSeconds: int32(a.Job.TimeoutSeconds), TraceParent: observability.Carrier(ctx), PipelineId: pipelineID}}})
+	span.SetAttributes(attribute.Bool("queued_for_delivery", delivered))
+	fields := observability.Fields(ctx, a.Job, a.Attempt)
+	fields = append(fields, "queued_for_delivery", delivered)
+	slog.InfoContext(ctx, "assignment queued", fields...)
+	return delivered
 }

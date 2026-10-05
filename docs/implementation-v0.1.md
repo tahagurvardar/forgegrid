@@ -33,3 +33,13 @@ A PostgreSQL pipeline row gate and all its jobs in ID order precede attempt/sess
 Completion/recovery/cancellation propagate dependencies/transitive skips and aggregate state in their authoritative transaction. Logical retry states remain nonterminal. HTTP pipeline submit/inspect/cancel and job cancel reuse existing execution/cancellation. No DAG transport service is added.
 
 Attempt deadlines are write-once at initial renewal (start fallback), separate from renewable leases. ACKs carry remaining execution budget for monotonic enforcement. Expired success is independently rejected; missing stop ACK retains reservation until lease expiry. See [pipeline semantics audit](pipeline-semantics-audit.md) for precedence, boundaries, races, and evidence. Earlier slice/Gate C scope statements above are historical; public cancellation and static DAGs are now implemented.
+
+## Milestone 4 implementation
+
+OpenTelemetry observes operation boundaries; asynchronous W3C traceparent travels in diagnostic job/attempt metadata and gRPC messages. Migration 004 also adds diagnostic eligible-queue timing, with no new tables or ownership predicates. Retry/recovery/dependency transitions preserve trace correlation while attempt identities remain distinct.
+
+Prometheus reads cached committed-state/history snapshots maintained through a separate bounded read-only PostgreSQL pool. Export uses bounded non-blocking batching; core services have no telemetry startup dependency. Structured JSON records correlate existing lifecycle decisions without copying workload output. Collector, Prometheus, and transient Jaeger are local Compose services. See [observability-audit.md](observability-audit.md). Earlier scope statements about deferred telemetry are historical; frontend remains deferred.
+
+## Milestone 5 implementation
+
+The React/TypeScript/Vite console uses existing submission/cancellation and read-only inspection. Minimum additions expose bounded lists, persisted timestamps/session metadata, direct historical attempt inspection and resumable browser SSE over the existing log store. No migrations, ownership predicates or gRPC changes were required. Inspection transactions are read-only; execution lock ordering remains unchanged. An optional Compose console profile serves static files and forwards same-origin API/SSE without a business layer. Earlier frontend-deferred statements above are historical. See [operational-console-audit.md](operational-console-audit.md).

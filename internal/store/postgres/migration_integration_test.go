@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"forgegrid/db/migrations"
-	"forgegrid/internal/domain"
 	"forgegrid/internal/testutil"
+	"github.com/google/uuid"
 )
 
 func TestUpgradeAndIdempotentCancellationMigration(t *testing.T) {
@@ -17,7 +17,9 @@ func TestUpgradeAndIdempotentCancellationMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Store{Pool: pool, Lease: 10 * time.Second, Offline: 6 * time.Second}
-	id, err := s.Submit(ctx, domain.Spec{Image: "alpine:3.22", Command: []string{"true"}, TimeoutSeconds: 10, MaxAttempts: 2})
+	// Seed using the original schema, not the current binary's post-migration API.
+	id := uuid.NewString()
+	_, err := pool.Exec(ctx, `INSERT INTO jobs(id,state,image,command,timeout_seconds,max_attempts) VALUES($1,'QUEUED','alpine:3.22','["true"]',10,2)`, id)
 	if err != nil {
 		t.Fatal(err)
 	}

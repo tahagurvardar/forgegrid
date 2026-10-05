@@ -25,6 +25,7 @@ services:
       OFFLINE_THRESHOLD: ${OFFLINE_THRESHOLD:-6s}
       EXECUTION_LEASE: ${EXECUTION_LEASE:-10s}
       RETRY_BASE: ${RETRY_BASE:-1s}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:9090:9090"
@@ -44,6 +45,7 @@ services:
     environment:
       CONTROL_PLANE_ADDR: control-plane:9090
       WORKER_ID: worker-a
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       LEASE_RENEW_INTERVAL: ${LEASE_RENEW_INTERVAL:-2s}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -55,13 +57,43 @@ services:
     environment:
       CONTROL_PLANE_ADDR: control-plane:9090
       WORKER_ID: worker-b
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       LEASE_RENEW_INTERVAL: ${LEASE_RENEW_INTERVAL:-2s}
   worker-c:
     <<: *worker
     environment:
       CONTROL_PLANE_ADDR: control-plane:9090
       WORKER_ID: worker-c
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       LEASE_RENEW_INTERVAL: ${LEASE_RENEW_INTERVAL:-2s}
+  otel-collector:
+    image: otel/opentelemetry-collector:0.135.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./deploy/observability/collector.yaml:/etc/otelcol/config.yaml:ro
+    mem_limit: 192m
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=1d", "--storage.tsdb.retention.size=128MB"]
+    ports:
+      - "127.0.0.1:9092:9090"
+    volumes:
+      - ./deploy/observability/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    mem_limit: 256m
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.21.0
+    ports:
+      - "127.0.0.1:16686:16686"
+    mem_limit: 256m
+  console:
+    profiles: ["console"]
+    build: ./frontend
+    image: forgegrid-console:dev
+    ports:
+      - "127.0.0.1:5173:8080"
+    depends_on:
+      control-plane:
+        condition: service_healthy
   verify:
     profiles: ["tools"]
     build:

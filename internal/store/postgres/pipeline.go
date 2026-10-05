@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"forgegrid/internal/domain"
+	"forgegrid/internal/observability"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"log/slog"
 )
 
 // The pipeline row is the outer gate. All pipeline jobs are locked, in ID
@@ -39,6 +42,9 @@ func lockPipelineForJob(ctx context.Context, tx pgx.Tx, jobID string, skip bool)
 }
 
 func (s *Store) SubmitPipeline(ctx context.Context, spec domain.PipelineSpec) (string, error) {
+	ctx, span := observability.Start(ctx, "pipeline.submit")
+	defer span.End()
+	span.SetAttributes(attribute.Bool("committed", false))
 	if err := spec.Validate(); err != nil {
 		return "", err
 	}
@@ -48,6 +54,7 @@ func (s *Store) SubmitPipeline(ctx context.Context, spec domain.PipelineSpec) (s
 	}
 	defer tx.Rollback(ctx)
 	id := uuid.NewString()
+	span.SetAttributes(attribute.String("pipeline_id", id), attribute.Int("job_count", len(spec.Jobs)))
 	if _, err = tx.Exec(ctx, `INSERT INTO pipelines(id,state) VALUES($1,'RUNNING')`, id); err != nil {
 		return "", err
 	}
@@ -63,7 +70,7 @@ func (s *Store) SubmitPipeline(ctx context.Context, spec domain.PipelineSpec) (s
 		if err != nil {
 			return "", err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO jobs(id,pipeline_id,job_key,state,image,command,timeout_seconds,max_attempts) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, jobID, id, j.Key, state, j.Image, argv, j.TimeoutSeconds, j.MaxAttempts); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO jobs(id,pipeline_id,job_key,state,image,command,timeout_seconds,max_attempts,trace_parent,last_queued_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $4='QUEUED' THEN clock_timestamp() ELSE NULL END)`, jobID, id, j.Key, state, j.Image, argv, j.TimeoutSeconds, j.MaxAttempts, observability.Carrier(ctx)); err != nil {
 			return "", err
 		}
 	}
@@ -77,6 +84,10 @@ func (s *Store) SubmitPipeline(ctx context.Context, spec domain.PipelineSpec) (s
 	if err = tx.Commit(ctx); err != nil {
 		return "", err
 	}
+	span.SetAttributes(attribute.Bool("committed", true))
+	fields := []any{"pipeline_id", id, "job_count", len(spec.Jobs)}
+	fields = append(fields, observability.TraceFields(ctx)...)
+	slog.InfoContext(ctx, "pipeline submitted", fields...)
 	return id, nil
 }
 
@@ -86,6 +97,9 @@ func refreshPipeline(ctx context.Context, tx pgx.Tx, id *string) error {
 	if id == nil {
 		return nil
 	}
+	_, skipSpan := observability.Start(ctx, "dag.propagate_skip", attribute.String("pipeline_id", *id))
+	defer skipSpan.End()
+	skipped := int64(0)
 	for {
 		tag, err := tx.Exec(ctx, `UPDATE jobs child SET state='SKIPPED',finished_at=clock_timestamp()
  WHERE child.pipeline_id=$1 AND child.state='BLOCKED' AND EXISTS
@@ -97,12 +111,21 @@ func refreshPipeline(ctx context.Context, tx pgx.Tx, id *string) error {
 		if tag.RowsAffected() == 0 {
 			break
 		}
+		skipped += tag.RowsAffected()
 	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs child SET state='QUEUED' WHERE child.pipeline_id=$1 AND child.state='BLOCKED'
- AND NOT EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.id=d.depends_on_job_id WHERE d.job_id=child.id AND parent.state<>'SUCCEEDED')`, *id); err != nil {
+	skipSpan.SetAttributes(attribute.Int64("affected_jobs", skipped))
+	releaseCtx, releaseSpan := observability.Start(ctx, "dag.release_dependencies", attribute.String("pipeline_id", *id))
+	tag, err := tx.Exec(ctx, `UPDATE jobs child SET state='QUEUED',trace_parent=$2,last_queued_at=clock_timestamp() WHERE child.pipeline_id=$1 AND child.state='BLOCKED'
+ AND NOT EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.id=d.depends_on_job_id WHERE d.job_id=child.id AND parent.state<>'SUCCEEDED')`, *id, observability.Carrier(releaseCtx))
+	releaseSpan.SetAttributes(attribute.Int64("affected_jobs", tag.RowsAffected()))
+	observability.End(releaseSpan, err)
+	if err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, `UPDATE pipelines p SET state=CASE
+	_, finalizeSpan := observability.Start(ctx, "pipeline.finalize", attribute.String("pipeline_id", *id))
+	defer finalizeSpan.End()
+	var pipelineState string
+	err = tx.QueryRow(ctx, `UPDATE pipelines p SET state=CASE
  WHEN EXISTS(SELECT 1 FROM jobs WHERE pipeline_id=p.id AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','SKIPPED'))
  THEN CASE WHEN p.cancel_requested_at IS NOT NULL THEN 'CANCELLING' ELSE 'RUNNING' END
  WHEN p.cancel_requested_at IS NOT NULL THEN 'CANCELLED'
@@ -110,7 +133,8 @@ func refreshPipeline(ctx context.Context, tx pgx.Tx, id *string) error {
  WHEN EXISTS(SELECT 1 FROM jobs WHERE pipeline_id=p.id AND state='CANCELLED') THEN 'CANCELLED'
  WHEN EXISTS(SELECT 1 FROM jobs WHERE pipeline_id=p.id AND state='SKIPPED') THEN 'FAILED'
  ELSE 'SUCCEEDED' END,
- finished_at=CASE WHEN NOT EXISTS(SELECT 1 FROM jobs WHERE pipeline_id=p.id AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','SKIPPED')) THEN COALESCE(p.finished_at,clock_timestamp()) ELSE NULL END WHERE p.id=$1`, *id)
+ finished_at=CASE WHEN NOT EXISTS(SELECT 1 FROM jobs WHERE pipeline_id=p.id AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','SKIPPED')) THEN COALESCE(p.finished_at,clock_timestamp()) ELSE NULL END WHERE p.id=$1 RETURNING state`, *id).Scan(&pipelineState)
+	finalizeSpan.SetAttributes(attribute.String("result", pipelineState), attribute.Bool("transaction_pending", true))
 	return err
 }
 
@@ -121,7 +145,7 @@ func (s *Store) GetPipeline(ctx context.Context, id string) (domain.Pipeline, er
 	}
 	defer tx.Rollback(ctx)
 	p := domain.Pipeline{Jobs: []domain.Job{}}
-	if err = tx.QueryRow(ctx, `SELECT id::text,state FROM pipelines WHERE id=$1`, id).Scan(&p.ID, &p.State); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT id::text,state,created_at,finished_at,(SELECT min(a.started_at) FROM job_attempts a JOIN jobs j ON j.id=a.job_id WHERE j.pipeline_id=pipelines.id) FROM pipelines WHERE id=$1`, id).Scan(&p.ID, &p.State, &p.CreatedAt, &p.FinishedAt, &p.StartedAt); err != nil {
 		return p, err
 	}
 	rows, err := tx.Query(ctx, `SELECT id::text FROM jobs WHERE pipeline_id=$1 ORDER BY job_key`, id)
@@ -152,6 +176,9 @@ func (s *Store) GetPipeline(ctx context.Context, id string) (domain.Pipeline, er
 }
 
 func (s *Store) CancelPipeline(ctx context.Context, id string) ([]domain.Identity, error) {
+	ctx, span := observability.Start(ctx, "pipeline.cancel", attribute.String("pipeline_id", id))
+	defer span.End()
+	span.SetAttributes(attribute.Bool("committed", false))
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -211,5 +238,9 @@ func (s *Store) CancelPipeline(ctx context.Context, id string) ([]domain.Identit
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	span.SetAttributes(attribute.Bool("committed", true))
+	fields := []any{"pipeline_id", id, "active_cancellations", len(active)}
+	fields = append(fields, observability.TraceFields(ctx)...)
+	slog.InfoContext(ctx, "pipeline cancellation committed", fields...)
 	return active, nil
 }

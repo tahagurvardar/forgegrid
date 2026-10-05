@@ -15,6 +15,7 @@ From the repository root:
 ./scripts/demo-recovery.ps1
 ./scripts/demo-pipeline.ps1
 ./scripts/demo-pipeline-recovery.ps1
+./scripts/demo-observability.ps1
 ```
 
 The normal demo builds the stack, registers worker-a/b/c, submits an argv job, and asserts PostgreSQL-backed success and both log streams. The recovery demo temporarily stops a/c, starts a fresh worker-b session, kills worker-b with SIGKILL, starts c, observes the offline session while attempt #1 still owns the job, waits for lease expiry, verifies LOST -> attempt #2 on c -> SUCCEEDED, and replays the old result through gRPC. It must print `STALE_ATTEMPT_REJECTED` and `WORKER_B_TO_WORKER_C_RECOVERY_PASSED`. Both demos use the existing local database; run them when no other jobs are being submitted. The recovery demo restores all three workers afterward.
@@ -76,6 +77,18 @@ Regenerate the committed Protobuf Go bindings:
 
 ## Implementation
 
+Milestone 5 adds a React/TypeScript/Vite operational console: worker/session capacity, pipeline DAG inspection, immutable attempt history and fencing/lease details, persisted recovery chronology, live resumable SSE output, existing cancellation and static pipeline submission. PostgreSQL remains authoritative. See [console APIs, semantics and verification](docs/operational-console-audit.md).
+
+```powershell
+docker compose --profile console up -d --build --wait postgres control-plane worker-a worker-b worker-c console
+# Console: http://localhost:5173
+./scripts/verify-frontend.ps1
+```
+
+The frontend verification script runs strict checks, production build, component/browser tests and real worker-b → worker-c browser recovery. Run it exclusively, without other submissions/recovery demos. For Vite development, stop the console service, then run `npm ci` and `npm run dev` in `frontend` with the backend running. State views poll; attempt output uses SSE and native sequence-based reconnect, with bounded browser memory. Exact worker offline-transition timestamps are not persisted and are not invented by the UI. DRAINING is explicitly unsupported.
+
+Milestone 4 adds distributed OpenTelemetry tracing through a Collector to Jaeger, bounded-cardinality Prometheus metrics, and correlated JSON operational logs. Run ./scripts/demo-observability.ps1 for the verified normal/recovery trace URLs; inspect Jaeger at http://localhost:16686 and Prometheus at http://localhost:9092. ./scripts/verify-observability.ps1 checks execution with backends absent or stopped mid-job. Telemetry remains optional for execution. See [observability semantics and evidence](docs/observability-audit.md).
+
 Pipeline HTTP submission uses POST /api/v1/pipelines with a jobs array; each entry adds key and dependencies to the existing image/argv/timeout/max_attempts spec. GET /api/v1/pipelines/{id} returns the DAG's jobs and attempt histories. POST /api/v1/jobs/{id}/cancel and POST /api/v1/pipelines/{id}/cancel persist cancellation before best-effort worker notification. See [pipeline semantics and verification](docs/pipeline-semantics-audit.md) for exact timeout, cancellation, retry, and final-state rules.
 
 - `cmd/controlplane`, `internal/controlplane`: HTTP/gRPC gateway, transactional scheduling, heartbeat detection, and lease recovery in one process.
@@ -91,8 +104,8 @@ See [execution semantics](docs/execution-semantics.md), [failure model](docs/fai
 
 ## Limits of this slice
 
-One Control Plane, no HA; static DAGs are bounded to 128 jobs/2,048 edges. No frontend, authentication, or TLS: HTTP/gRPC are for trusted local development with loopback host bindings. Workers require Docker daemon access; this is not a hostile multi-tenant sandbox. Workload containers are non-privileged. Pipeline coordination is deliberately serialized; no scale claim is made. Control Plane/workers upgrade together for execution-budget ACKs.
+One Control Plane, no HA; static DAGs are bounded to 128 jobs/2,048 edges. No authentication or TLS: console/HTTP/gRPC are for trusted local development with loopback host bindings. Workers require Docker daemon access; this is not a hostile multi-tenant sandbox. Workload containers are non-privileged. Pipeline coordination is deliberately serialized; no scale claim is made. Control Plane/workers upgrade together for execution-budget ACKs.
 
 A process crash can leave a physical container running. Startup reconciliation removes older-session containers for the same worker identity on the accessible daemon; inaccessible machines cannot be remotely cleaned up. Local cancellation attempts Docker removal with a bounded timeout and logs failures, so physical shutdown cannot be guaranteed when the daemon is unavailable. A permanently lost worker's container may require manual removal using its ForgeGrid labels.
 
-Log delivery has a bounded in-memory queue/retries with persistence ACKs. Crashes/cancellation can lose unacknowledged logs; there is no durable spool/browser streaming or total storage retention policy. Old immutable attempt logs remain diagnostic. Structured process logs are implemented; Prometheus/OpenTelemetry infrastructure is deferred. Submission idempotency keys, DAG mutation, dynamic DAGs, matrix, expressions, fail-fast, artifacts, authentication, secrets, and integrations remain deferred. Public job/pipeline cancellation is implemented.
+Log delivery has a bounded in-memory queue/retries with persistence ACKs. Crashes/cancellation can lose unacknowledged logs; there is no durable spool or total storage retention policy. Browser SSE reads persisted logs; old immutable attempt logs remain diagnostic. Tracing queues and local telemetry retention are bounded; backend outages/crashes may lose spans. Metrics history aggregation has overhead and no scale claim. Submission idempotency keys, DAG mutation, dynamic DAGs, matrix, expressions, fail-fast, artifacts, authentication, secrets, and integrations remain deferred. Public job/pipeline cancellation and the operational console are implemented.

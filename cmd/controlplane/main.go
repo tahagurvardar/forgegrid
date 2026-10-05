@@ -13,12 +13,15 @@ import (
 	pb "forgegrid/gen/go/forgegrid/v1"
 	"forgegrid/internal/config"
 	"forgegrid/internal/controlplane"
+	"forgegrid/internal/observability"
 	"forgegrid/internal/store/postgres"
 	"google.golang.org/grpc"
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service.name", "forgegrid-controlplane"))
+	shutdownTelemetry := observability.Init("forgegrid-controlplane")
+	defer shutdownTelemetry()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	startup, stop := context.WithTimeout(ctx, 30*time.Second)
@@ -37,6 +40,8 @@ func main() {
 		os.Exit(1)
 	}
 	stop()
+	store.Metrics = observability.NewMetrics()
+	go store.Observe(ctx, store.Metrics)
 	server := controlplane.New(store, config.Duration("HEARTBEAT_INTERVAL", 2*time.Second))
 	grpcServer := grpc.NewServer(grpc.MaxRecvMsgSize(256 * 1024))
 	pb.RegisterWorkerControlServer(grpcServer, server)

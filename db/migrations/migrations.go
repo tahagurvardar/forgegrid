@@ -10,3 +10,6 @@ var InternalCancellation string
 
 //go:embed 003_pipeline_semantics.sql
 var PipelineSemantics string
+
+//go:embed 004_observability.sql
+var Observability string
