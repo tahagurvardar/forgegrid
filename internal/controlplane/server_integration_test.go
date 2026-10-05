@@ -126,7 +126,7 @@ func TestCommittedAssignmentSurvivesDispatchFailure(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
 				}
-				f.in <- &pb.WorkerMessage{Body: &pb.WorkerMessage_Heartbeat{Heartbeat: &pb.Heartbeat{WorkerSessionId: b}}}
+				// Send failure must terminate Connect even while Recv is blocked.
 			}
 			select {
 			case <-done:

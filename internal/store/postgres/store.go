@@ -45,6 +45,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, migrations.InternalCancellation); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(ctx, migrations.PipelineSemantics); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 func (s *Store) Submit(ctx context.Context, spec domain.Spec) (string, error) {
@@ -102,23 +105,23 @@ func (s *Store) Disconnect(ctx context.Context, session string) error {
 	return err
 }
 
-const jobColumns = `id::text,state,image,command,timeout_seconds,max_attempts,current_attempt_id::text,fencing_token,attempt_count`
+const jobColumns = `id::text,state,image,command,timeout_seconds,max_attempts,current_attempt_id::text,fencing_token,attempt_count,pipeline_id::text,job_key`
 
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var j domain.Job
 	var argv []byte
-	err := row.Scan(&j.ID, &j.State, &j.Image, &argv, &j.TimeoutSeconds, &j.MaxAttempts, &j.CurrentAttemptID, &j.FencingToken, &j.AttemptCount)
+	err := row.Scan(&j.ID, &j.State, &j.Image, &argv, &j.TimeoutSeconds, &j.MaxAttempts, &j.CurrentAttemptID, &j.FencingToken, &j.AttemptCount, &j.PipelineID, &j.Key)
 	if err == nil {
 		err = json.Unmarshal(argv, &j.Command)
 	}
 	return j, err
 }
 
-const attemptColumns = `a.id::text,a.job_id::text,a.attempt_number,a.fencing_token,a.worker_session_id::text,a.state,a.lease_expires_at,a.exit_code,a.failure_kind,a.failure_detail,w.worker_id`
+const attemptColumns = `a.id::text,a.job_id::text,a.attempt_number,a.fencing_token,a.worker_session_id::text,a.state,a.lease_expires_at,a.exit_code,a.failure_kind,a.failure_detail,w.worker_id,a.execution_deadline_at`
 
 func scanAttempt(row pgx.Row) (domain.Attempt, error) {
 	var a domain.Attempt
-	err := row.Scan(&a.AttemptID, &a.JobID, &a.Number, &a.FencingToken, &a.SessionID, &a.State, &a.LeaseExpiresAt, &a.ExitCode, &a.FailureKind, &a.FailureDetail, &a.WorkerID)
+	err := row.Scan(&a.AttemptID, &a.JobID, &a.Number, &a.FencingToken, &a.SessionID, &a.State, &a.LeaseExpiresAt, &a.ExitCode, &a.FailureKind, &a.FailureDetail, &a.WorkerID, &a.ExecutionDeadline)
 	return a, err
 }
 func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
@@ -127,6 +130,13 @@ func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
 		return domain.Job{}, err
 	}
 	defer tx.Rollback(ctx)
+	j, err := getJob(ctx, tx, id)
+	if err != nil {
+		return j, err
+	}
+	return j, tx.Commit(ctx)
+}
+func getJob(ctx context.Context, tx pgx.Tx, id string) (domain.Job, error) {
 	j, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1`, id))
 	if err != nil {
 		return j, err
@@ -148,18 +158,53 @@ func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
 	if err = rows.Err(); err != nil {
 		return j, err
 	}
-	return j, tx.Commit(ctx)
+	if j.PipelineID != nil {
+		if err = tx.QueryRow(ctx, `SELECT COALESCE(array_agg(parent.job_key ORDER BY parent.job_key),'{}'::text[]) FROM job_dependencies d JOIN jobs parent ON parent.id=d.depends_on_job_id WHERE d.job_id=$1`, id).Scan(&j.Dependencies); err != nil {
+			return j, err
+		}
+	}
+	return j, nil
 }
 func (s *Store) Schedule(ctx context.Context, connected []string) (*domain.Assignment, error) {
 	if len(connected) == 0 {
 		return nil, nil
 	}
+	rows, err := s.Pool.Query(ctx, `SELECT id::text FROM jobs WHERE state='QUEUED' AND attempt_count<max_attempts ORDER BY created_at,id LIMIT 128`)
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		a, err := s.scheduleJob(ctx, id, connected)
+		if err != nil || a != nil {
+			return a, err
+		}
+	}
+	return nil, nil
+}
+func (s *Store) scheduleJob(ctx context.Context, id string, connected []string) (*domain.Assignment, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	j, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE state='QUEUED' AND attempt_count<max_attempts ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1`))
+	locked, err := lockPipelineForJob(ctx, tx, id, true)
+	if err != nil || !locked {
+		return nil, err
+	}
+	j, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 AND state='QUEUED' AND attempt_count<max_attempts FOR UPDATE SKIP LOCKED`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -210,6 +255,9 @@ func lockOwner(ctx context.Context, tx pgx.Tx, id domain.Identity) (domain.Job, 
 	if err != nil {
 		return j, a, state, now, err
 	}
+	if _, err = lockPipelineForJob(ctx, tx, jobID, false); err != nil {
+		return j, a, state, now, err
+	}
 	j, err = scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, jobID))
 	if err != nil {
 		return j, a, state, now, err
@@ -241,6 +289,9 @@ func (s *Store) Advance(ctx context.Context, id domain.Identity, action string) 
 	if j.State == "CANCELLING" {
 		return 0, domain.ErrCancelled
 	}
+	if timedOut(a, now) {
+		return 0, domain.ErrTimeout
+	}
 	var connected bool
 	if err = tx.QueryRow(ctx, `SELECT connected FROM worker_sessions WHERE id=$1`, id.SessionID).Scan(&connected); err != nil {
 		return 0, err
@@ -252,11 +303,11 @@ func (s *Store) Advance(ctx context.Context, id domain.Identity, action string) 
 	case "accept":
 		_, err = tx.Exec(ctx, `UPDATE job_attempts SET accepted_at=COALESCE(accepted_at,clock_timestamp()) WHERE id=$1`, id.AttemptID)
 	case "start":
-		if _, err = tx.Exec(ctx, `UPDATE job_attempts SET state='RUNNING',started_at=COALESCE(started_at,clock_timestamp()) WHERE id=$1`, id.AttemptID); err == nil {
+		if _, err = tx.Exec(ctx, `UPDATE job_attempts SET state='RUNNING',started_at=COALESCE(started_at,clock_timestamp()),execution_deadline_at=COALESCE(execution_deadline_at,clock_timestamp()+$2*interval '1 second') WHERE id=$1`, id.AttemptID, j.TimeoutSeconds); err == nil {
 			_, err = tx.Exec(ctx, `UPDATE jobs SET state='RUNNING' WHERE id=$1`, j.ID)
 		}
 	case "renew":
-		_, err = tx.Exec(ctx, `UPDATE job_attempts SET lease_expires_at=clock_timestamp()+$2*interval '1 millisecond' WHERE id=$1`, id.AttemptID, s.Lease.Milliseconds())
+		_, err = tx.Exec(ctx, `UPDATE job_attempts SET lease_expires_at=clock_timestamp()+$2*interval '1 millisecond',execution_deadline_at=COALESCE(execution_deadline_at,clock_timestamp()+$3*interval '1 second') WHERE id=$1`, id.AttemptID, s.Lease.Milliseconds(), j.TimeoutSeconds)
 	default:
 		return 0, errors.New("invalid action")
 	}
@@ -304,6 +355,9 @@ func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Resul
 	if j.State != "CANCELLING" && r.State == "CANCELLED" {
 		return false, domain.ErrConflict
 	}
+	if j.State != "CANCELLING" && timedOut(a, now) && r.State != "TIMED_OUT" {
+		return false, domain.ErrTimeout
+	}
 	if err = s.finish(ctx, tx, j, a, r); err != nil {
 		return false, err
 	}
@@ -321,7 +375,10 @@ func (s *Store) finish(ctx context.Context, tx pgx.Tx, j domain.Job, a domain.At
 		return err
 	}
 	_, err := tx.Exec(ctx, `UPDATE worker_sessions SET active_slots=active_slots-1 WHERE id=$1`, a.SessionID)
-	return err
+	if err != nil {
+		return err
+	}
+	return refreshPipeline(ctx, tx, j.PipelineID)
 }
 
 // Cancel is an internal coordination primitive. It does not release active
@@ -333,6 +390,26 @@ func (s *Store) Cancel(ctx context.Context, jobID string) (*domain.Identity, err
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err = lockPipelineForJob(ctx, tx, jobID, false); err != nil {
+		return nil, err
+	}
+	id, err := cancelJob(ctx, tx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	var pipelineID *string
+	if err = tx.QueryRow(ctx, `SELECT pipeline_id::text FROM jobs WHERE id=$1`, jobID).Scan(&pipelineID); err != nil {
+		return nil, err
+	}
+	if err = refreshPipeline(ctx, tx, pipelineID); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return id, nil
+}
+func cancelJob(ctx context.Context, tx pgx.Tx, jobID string) (*domain.Identity, error) {
 	j, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, jobID))
 	if err != nil {
 		return nil, err
@@ -357,14 +434,11 @@ func (s *Store) Cancel(ctx context.Context, jobID string) (*domain.Identity, err
 		identity = &i
 		next = "CANCELLING"
 		if j.State == "CANCELLING" {
-			return identity, tx.Commit(ctx)
+			return identity, nil
 		}
 	}
 	_, err = tx.Exec(ctx, `UPDATE jobs SET state=$2,cancel_requested_at=clock_timestamp(),retry_available_at=NULL,finished_at=CASE WHEN $2='CANCELLED' THEN clock_timestamp() ELSE NULL END WHERE id=$1`, jobID, next)
 	if err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return identity, nil
@@ -383,17 +457,46 @@ func (s *Store) Recover(ctx context.Context) error {
 			break
 		}
 	}
-	_, err := s.Pool.Exec(ctx, `UPDATE jobs SET state='QUEUED' WHERE state='RETRY_WAIT' AND retry_available_at<=clock_timestamp()`)
-	return err
+	return s.requeue(ctx)
 }
 func (s *Store) recoverOne(ctx context.Context) (bool, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT j.id::text FROM jobs j JOIN job_attempts a ON a.id=j.current_attempt_id WHERE a.state IN ('ASSIGNED','RUNNING') AND a.lease_expires_at<=clock_timestamp() ORDER BY a.lease_expires_at,j.id LIMIT 128`)
+	if err != nil {
+		return false, err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		done, err := s.recoverJob(ctx, id)
+		if err != nil || done {
+			return done, err
+		}
+	}
+	return false, nil
+}
+func (s *Store) recoverJob(ctx context.Context, id string) (bool, error) {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	locked, err := lockPipelineForJob(ctx, tx, id, true)
+	if err != nil || !locked {
+		return false, err
+	}
 	var jobID, attemptID string
-	err = tx.QueryRow(ctx, `SELECT j.id::text,a.id::text FROM jobs j JOIN job_attempts a ON a.id=j.current_attempt_id WHERE a.state IN ('ASSIGNED','RUNNING') AND a.lease_expires_at<=clock_timestamp() ORDER BY a.lease_expires_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1`).Scan(&jobID, &attemptID)
+	err = tx.QueryRow(ctx, `SELECT j.id::text,a.id::text FROM jobs j JOIN job_attempts a ON a.id=j.current_attempt_id WHERE j.id=$1 AND a.state IN ('ASSIGNED','RUNNING') AND a.lease_expires_at<=clock_timestamp() FOR UPDATE OF j SKIP LOCKED`, id).Scan(&jobID, &attemptID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -407,10 +510,88 @@ func (s *Store) recoverOne(ctx context.Context) (bool, error) {
 	if !domain.Active(a.State) || now.Before(a.LeaseExpiresAt) {
 		return false, nil
 	}
-	if err = s.finish(ctx, tx, j, a, domain.Result{State: "LOST", ExitCode: -1, FailureKind: "LEASE_EXPIRED", Detail: "execution lease expired"}); err != nil {
+	r := domain.Result{State: "LOST", ExitCode: -1, FailureKind: "LEASE_EXPIRED", Detail: "execution lease expired"}
+	// A delayed scanner must classify the first expired authority, not turn
+	// an earlier infrastructure lease loss into workload failure just because
+	// the execution deadline also elapsed during Control Plane downtime.
+	if j.State != "CANCELLING" && a.ExecutionDeadline != nil && !a.ExecutionDeadline.After(a.LeaseExpiresAt) {
+		r = domain.Result{State: "TIMED_OUT", ExitCode: -1, FailureKind: "JOB_TIMEOUT", Detail: "execution deadline exceeded before lease recovery"}
+	}
+	if err = s.finish(ctx, tx, j, a, r); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
+}
+func timedOut(a domain.Attempt, now time.Time) bool {
+	return a.ExecutionDeadline != nil && !now.Before(*a.ExecutionDeadline)
+}
+
+// Read-only ACK allowance. The deadline is write-once for each attempt. A
+// delayed read/ACK can only reduce authority, never reset the timeout budget.
+func (s *Store) ExecutionBudget(ctx context.Context, id domain.Identity) (int64, error) {
+	var budget int64
+	err := s.Pool.QueryRow(ctx, `SELECT GREATEST(0,floor(extract(epoch FROM (execution_deadline_at-clock_timestamp()))*1000))::bigint FROM job_attempts WHERE id=$1 AND fencing_token=$2 AND worker_session_id=$3`, id.AttemptID, id.FencingToken, id.SessionID).Scan(&budget)
+	return budget, err
+}
+
+func (s *Store) requeue(ctx context.Context) error {
+	rows, err := s.Pool.Query(ctx, `SELECT id::text FROM jobs WHERE state='RETRY_WAIT' AND retry_available_at<=clock_timestamp() ORDER BY retry_available_at,id`)
+	if err != nil {
+		return err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := s.requeueJob(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *Store) requeueJob(ctx context.Context, id string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	locked, err := lockPipelineForJob(ctx, tx, id, true)
+	if err != nil || !locked {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE jobs SET state='QUEUED' WHERE id=$1 AND state='RETRY_WAIT' AND retry_available_at<=clock_timestamp()`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// Notification only: deadlines reject renewal/completion independently. No
+// capacity is released here while a lease is still valid.
+func (s *Store) ExpiredExecutions(ctx context.Context) ([]domain.Identity, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT a.id::text,a.fencing_token,a.worker_session_id::text FROM job_attempts a JOIN jobs j ON j.current_attempt_id=a.id WHERE a.state IN ('ASSIGNED','RUNNING') AND j.state<>'CANCELLING' AND a.execution_deadline_at<=clock_timestamp() AND a.lease_expires_at>clock_timestamp()`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []domain.Identity{}
+	for rows.Next() {
+		var id domain.Identity
+		if err = rows.Scan(&id.AttemptID, &id.FencingToken, &id.SessionID); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 type Session struct {

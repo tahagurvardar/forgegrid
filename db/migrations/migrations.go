@@ -7,3 +7,6 @@ var Initial string
 
 //go:embed 002_internal_cancellation.sql
 var InternalCancellation string
+
+//go:embed 003_pipeline_semantics.sql
+var PipelineSemantics string

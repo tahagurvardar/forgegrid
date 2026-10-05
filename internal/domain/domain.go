@@ -12,6 +12,7 @@ var ErrSession = errors.New("INVALID_SESSION")
 var ErrConflict = errors.New("CONFLICTING_COMPLETION")
 var ErrCancelled = errors.New("CANCELLATION_REQUESTED")
 var ErrTerminal = errors.New("ALREADY_TERMINAL")
+var ErrTimeout = errors.New("EXECUTION_TIMEOUT")
 
 type Spec struct {
 	Image          string   `json:"image"`
@@ -53,17 +54,21 @@ type Identity struct {
 }
 type Attempt struct {
 	Identity
-	JobID          string    `json:"job_id"`
-	Number         int       `json:"attempt_number"`
-	WorkerID       string    `json:"worker_id"`
-	State          string    `json:"state"`
-	LeaseExpiresAt time.Time `json:"lease_expires_at"`
-	ExitCode       *int32    `json:"exit_code"`
-	FailureKind    string    `json:"failure_kind"`
-	FailureDetail  string    `json:"failure_detail"`
+	JobID             string     `json:"job_id"`
+	Number            int        `json:"attempt_number"`
+	WorkerID          string     `json:"worker_id"`
+	State             string     `json:"state"`
+	LeaseExpiresAt    time.Time  `json:"lease_expires_at"`
+	ExecutionDeadline *time.Time `json:"execution_deadline_at,omitempty"`
+	ExitCode          *int32     `json:"exit_code"`
+	FailureKind       string     `json:"failure_kind"`
+	FailureDetail     string     `json:"failure_detail"`
 }
 type Job struct {
-	ID string `json:"id"`
+	ID           string   `json:"id"`
+	PipelineID   *string  `json:"pipeline_id,omitempty"`
+	Key          *string  `json:"key,omitempty"`
+	Dependencies []string `json:"dependencies,omitempty"`
 	Spec
 	State            string    `json:"state"`
 	CurrentAttemptID *string   `json:"current_attempt_id"`

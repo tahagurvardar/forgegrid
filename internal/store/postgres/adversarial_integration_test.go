@@ -20,6 +20,8 @@ func snapshot(t *testing.T, s *Store, ctx context.Context) string {
 	t.Helper()
 	var value string
 	err := s.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'pipelines',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY id),'[]') FROM pipelines t),
+ 'dependencies',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY job_id,depends_on_job_id),'[]') FROM job_dependencies t),
  'workers',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY id),'[]') FROM workers t),
  'sessions',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY id),'[]') FROM worker_sessions t),
  'jobs',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY id),'[]') FROM jobs t),

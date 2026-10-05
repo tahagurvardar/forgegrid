@@ -19,10 +19,12 @@ import (
 
 type orderingPeer struct {
 	pb.UnimplementedWorkerControlServer
-	store           *postgres.Store
-	results         chan error
-	cancel          bool
-	cancelBeforeACK bool
+	store            *postgres.Store
+	results          chan error
+	cancel           bool
+	cancelBeforeACK  bool
+	timeoutBeforeACK bool
+	budgetOnly       bool
 }
 
 func assignment(a *domain.Assignment) *pb.ControlMessage {
@@ -88,13 +90,25 @@ func (p *orderingPeer) Connect(stream pb.WorkerControl_ConnectServer) (err error
 			var ttl time.Duration
 			ttl, err = p.store.Advance(ctx, peerIdentity(req.Identity), "renew")
 			if err == nil && p.cancelBeforeACK {
-				_, err = p.store.Cancel(ctx, a.Job.ID)
+				reason := domain.ErrCancelled.Error()
+				if p.timeoutBeforeACK {
+					_, err = p.store.Pool.Exec(ctx, `UPDATE job_attempts SET execution_deadline_at=clock_timestamp()-interval '1 second' WHERE id=$1`, req.Identity.AttemptId)
+					reason = domain.ErrTimeout.Error()
+				} else {
+					_, err = p.store.Cancel(ctx, a.Job.ID)
+				}
 				if err == nil {
-					err = stream.Send(&pb.ControlMessage{Body: &pb.ControlMessage_CancelAttempt{CancelAttempt: &pb.CancelAttempt{Identity: req.Identity, Reason: domain.ErrCancelled.Error()}}})
+					if !p.budgetOnly {
+						err = stream.Send(&pb.ControlMessage{Body: &pb.ControlMessage_CancelAttempt{CancelAttempt: &pb.CancelAttempt{Identity: req.Identity, Reason: reason}}})
+					}
 				}
 			}
 			if err == nil {
-				err = stream.Send(&pb.ControlMessage{Body: &pb.ControlMessage_LeaseRenewed{LeaseRenewed: &pb.LeaseRenewed{Identity: req.Identity, RequestId: req.RequestId, TtlMs: ttl.Milliseconds()}}})
+				var budget int64
+				budget, err = p.store.ExecutionBudget(ctx, peerIdentity(req.Identity))
+				if err == nil {
+					err = stream.Send(&pb.ControlMessage{Body: &pb.ControlMessage_LeaseRenewed{LeaseRenewed: &pb.LeaseRenewed{Identity: req.Identity, RequestId: req.RequestId, TtlMs: ttl.Milliseconds(), ExecutionBudgetMs: budget}}})
+				}
 			}
 		case msg.GetAttemptStarted() != nil:
 			_, err = p.store.Advance(ctx, peerIdentity(msg.GetAttemptStarted()), "start")
@@ -119,7 +133,11 @@ func (p *orderingPeer) Connect(stream pb.WorkerControl_ConnectServer) (err error
 			}
 			count++
 			if p.cancel {
-				if result.State != "CANCELLED" {
+				want := "CANCELLED"
+				if p.timeoutBeforeACK {
+					want = "TIMED_OUT"
+				}
+				if result.State != want {
 					return fmt.Errorf("cancel acknowledged as %s", result.State)
 				}
 				p.results <- nil
@@ -150,10 +168,11 @@ func (p *orderingPeer) Connect(stream pb.WorkerControl_ConnectServer) (err error
 }
 
 func TestWorkerMessageOrderingWithPostgres(t *testing.T) {
-	for _, mode := range []string{"next-assignment-before-result-ack", "cancel-running", "cancel-before-initial-renewal-ack"} {
+	for _, mode := range []string{"next-assignment-before-result-ack", "cancel-running", "cancel-before-initial-renewal-ack", "timeout-before-initial-renewal-ack", "expired-execution-budget-ack"} {
 		t.Run(mode, func(t *testing.T) {
 			cancelRequested := mode != "next-assignment-before-result-ack"
-			cancelBeforeACK := mode == "cancel-before-initial-renewal-ack"
+			cancelBeforeACK := mode == "cancel-before-initial-renewal-ack" || mode == "timeout-before-initial-renewal-ack" || mode == "expired-execution-budget-ack"
+			timeoutBeforeACK := mode == "timeout-before-initial-renewal-ack" || mode == "expired-execution-budget-ack"
 			pool, ctx := testutil.Database(t)
 			store := &postgres.Store{Pool: pool, Lease: 2 * time.Second, Offline: 10 * time.Second}
 			if err := store.Migrate(ctx); err != nil {
@@ -171,7 +190,7 @@ func TestWorkerMessageOrderingWithPostgres(t *testing.T) {
 				}
 				jobs = append(jobs, id)
 			}
-			peer := &orderingPeer{store: store, results: make(chan error, 2), cancel: cancelRequested, cancelBeforeACK: cancelBeforeACK}
+			peer := &orderingPeer{store: store, results: make(chan error, 2), cancel: cancelRequested, cancelBeforeACK: cancelBeforeACK, timeoutBeforeACK: timeoutBeforeACK, budgetOnly: mode == "expired-execution-budget-ack"}
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -233,6 +252,9 @@ func TestWorkerMessageOrderingWithPostgres(t *testing.T) {
 				want := "SUCCEEDED"
 				if cancelRequested {
 					want = "CANCELLED"
+				}
+				if timeoutBeforeACK {
+					want = "FAILED"
 				}
 				if j.State != want || j.AttemptCount != 1 {
 					t.Fatalf("unexpected persisted result %+v", j)

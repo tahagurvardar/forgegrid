@@ -23,3 +23,13 @@ The pre-change classification and regression evidence are in [correctness-audit.
 - Workers ignore renewal ACKs received after cancellation intent. A cancellation ACK follows executor return and cleanup attempts, including log draining; Docker shutdown remains best effort if its daemon cannot be reached.
 - Tests order transactions with PostgreSQL triggers, advisory barriers, and observed lock waits. Injected write failures and deferred constraint-trigger failures test full rollback, including commit-time failure. These hooks exist only in isolated test schemas, not in production coordination code.
 - Separate test processes run production Control Plane/worker components. SIGKILL and real Docker executions verify exact crash windows, physical orphan survival/overlap, startup reconciliation, and stale result rejection. No fault endpoints or additional infrastructure are introduced.
+
+## Milestone 3 implementation
+
+Gate D adds pipelines and immutable job_dependencies to the original five tables. Standalone jobs remain supported with nullable membership. Validation rejects invalid DAGs before one submission transaction persists jobs/edges.
+
+A PostgreSQL pipeline row gate and all its jobs in ID order precede attempt/session locks. Scheduling/recovery use SKIP LOCKED at the gate before candidate jobs; completion/cancellation/renewal wait on it. Whole-pipeline cancellation prelocks active attempts and sessions by ID. This serializes bounded pipeline coordination while allowing Docker branches to execute concurrently and preserves ownership lock order.
+
+Completion/recovery/cancellation propagate dependencies/transitive skips and aggregate state in their authoritative transaction. Logical retry states remain nonterminal. HTTP pipeline submit/inspect/cancel and job cancel reuse existing execution/cancellation. No DAG transport service is added.
+
+Attempt deadlines are write-once at initial renewal (start fallback), separate from renewable leases. ACKs carry remaining execution budget for monotonic enforcement. Expired success is independently rejected; missing stop ACK retains reservation until lease expiry. See [pipeline semantics audit](pipeline-semantics-audit.md) for precedence, boundaries, races, and evidence. Earlier slice/Gate C scope statements above are historical; public cancellation and static DAGs are now implemented.

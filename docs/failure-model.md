@@ -25,3 +25,18 @@ Docker owns job containers independently of the agent process. SIGKILL removes t
 Run `scripts/demo-recovery.ps1` for the worker-b -> worker-c proof, including delayed result replay. Run `scripts/test-leaseguard.ps1` to stop the Control Plane and prove the live worker cancels without renewal ACKs. Integration tests additionally exercise scheduling/completion concurrency, supersession, and lease expiry during a real row-lock wait.
 
 Run `scripts/verify-recovery.ps1` for isolated-schema, separate-process crash tests: commit before dispatch, Docker start before persisted AttemptStarted, worker SIGKILL with a surviving container and overlapping retry, fresh-session orphan reconciliation, and cancellation of a real Docker execution. Tests kill only their own helper processes and remove only containers labelled with their unique worker IDs. Their PostgreSQL barriers select the crash windows explicitly; they do not depend on guessing transaction timing.
+
+## Pipeline failures
+
+| Failure/race | Behavior |
+|---|---|
+| Parent permanently fails | Unresolved descendants become SKIPPED in that transaction; unrelated branches continue. |
+| Parent has retry capacity | Children remain BLOCKED until valid success/exhaustion; stale attempts cannot release them. |
+| Concurrent fan-in completion | PostgreSQL gate serializes readiness; conditional BLOCKED transition releases once. |
+| Cancel races dependency release | Same gate/job locks; cancelled children cannot be resurrected. |
+| Pipeline cancelled with active workers | All nonterminal jobs receive durable intent atomically; slots remain reserved until valid stop ACK or expiry. |
+| Timeout with worker gone | No renewal/late success accepted; recovery records TIMED_OUT without retry when its persisted execution deadline precedes or equals lease expiry. Earlier lease expiry remains LOST with bounded infrastructure retry, even if scanning occurs after both deadlines. Prior committed cancellation yields logical CANCELLED. |
+| Another branch active | Pipeline stays RUNNING/CANCELLING until every job is terminal. |
+| Control Send fails while Recv blocks | Handler observes send failure independently and disconnects; ownership remains reserved. |
+
+Execution budget excludes queue/dependency wait and includes preparation/log drain/accepted reporting. PostgreSQL deadlines are independent of scanning and never renewed. ACK budgets avoid a fresh timeout on delayed delivery. See the [pipeline audit](pipeline-semantics-audit.md). Run scripts/demo-pipeline.ps1 for parallel success/failure and scripts/demo-pipeline-recovery.ps1 for fenced worker-b → worker-c recovery inside the DAG.

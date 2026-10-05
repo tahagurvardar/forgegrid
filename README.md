@@ -1,6 +1,6 @@
 # ForgeGrid
 
-ForgeGrid is a Go distributed job execution engine. Milestones 1A and 1B implement the execution backbone described in [architecture-v0.1](docs/architecture-v0.1.md): PostgreSQL owns coordination state, outbound gRPC connects workers, and Docker executes trusted local jobs.
+ForgeGrid is a Go distributed job execution engine with static DAG pipelines. The execution/recovery backbone, concurrency milestone, and Milestone 3 pipeline semantics follow [architecture-v0.1](docs/architecture-v0.1.md): PostgreSQL owns coordination state, outbound gRPC connects workers, and Docker executes trusted local jobs.
 
 Execution is **at least once physically**, with a single authoritative terminal winner. Killing an agent can leave its Docker job container alive. Lease expiry and fencing prevent that old attempt from finalizing the logical job.
 
@@ -13,6 +13,8 @@ From the repository root:
 ```powershell
 ./scripts/demo-normal.ps1
 ./scripts/demo-recovery.ps1
+./scripts/demo-pipeline.ps1
+./scripts/demo-pipeline-recovery.ps1
 ```
 
 The normal demo builds the stack, registers worker-a/b/c, submits an argv job, and asserts PostgreSQL-backed success and both log streams. The recovery demo temporarily stops a/c, starts a fresh worker-b session, kills worker-b with SIGKILL, starts c, observes the offline session while attempt #1 still owns the job, waits for lease expiry, verifies LOST -> attempt #2 on c -> SUCCEEDED, and replays the old result through gRPC. It must print `STALE_ATTEMPT_REJECTED` and `WORKER_B_TO_WORKER_C_RECOVERY_PASSED`. Both demos use the existing local database; run them when no other jobs are being submitted. The recovery demo restores all three workers afterward.
@@ -41,6 +43,8 @@ docker compose down
 ```
 
 ## Verify
+
+Pipeline demos show build → unit-test/lint in parallel → package, both success and permanent branch failure with package SKIPPED. The pipeline recovery demo kills worker-b during test, retains package BLOCKED through lease expiry/retry, rejects stale replay, and proves worker-c success releases package. Like the original recovery demo, it restores all workers and should run without concurrent submissions.
 
 ```powershell
 ./scripts/verify.ps1
@@ -72,10 +76,12 @@ Regenerate the committed Protobuf Go bindings:
 
 ## Implementation
 
+Pipeline HTTP submission uses POST /api/v1/pipelines with a jobs array; each entry adds key and dependencies to the existing image/argv/timeout/max_attempts spec. GET /api/v1/pipelines/{id} returns the DAG's jobs and attempt histories. POST /api/v1/jobs/{id}/cancel and POST /api/v1/pipelines/{id}/cancel persist cancellation before best-effort worker notification. See [pipeline semantics and verification](docs/pipeline-semantics-audit.md) for exact timeout, cancellation, retry, and final-state rules.
+
 - `cmd/controlplane`, `internal/controlplane`: HTTP/gRPC gateway, transactional scheduling, heartbeat detection, and lease recovery in one process.
 - `cmd/worker`, `internal/worker`: process session UUID, heartbeats, renewal requests, monotonic lease guard, Docker CLI executor, log collector, and startup reconciliation.
 - `internal/domain`: ownership checks, specification validation, result classification, and capped infrastructure retry policy.
-- `internal/store/postgres`, `db/migrations`: explicit pgx SQL, row locks, durable attempts, reserved capacity, and duplicate-safe log chunks. Embedded migrations run transactionally under a PostgreSQL advisory lock; migration 002 adds internal cancellation to the original five tables. Reapplication and upgrade from the initial schema are tested.
+- `internal/store/postgres`, `db/migrations`: explicit pgx SQL, row locks, durable attempts, capacity, duplicate-safe logs, and transactional DAG coordination. Embedded migrations run under a PostgreSQL advisory lock; 002 adds cancellation and 003 adds pipelines/dependencies and execution deadlines. Seven tables; upgrade/reapplication tested.
 - `api/proto/forgegrid/v1`, `gen/go`: versioned contracts and generated bindings.
 - `tests`, `scripts`: Docker end-to-end checks, diagnostic result replay, and repeatable demos.
 
@@ -85,8 +91,8 @@ See [execution semantics](docs/execution-semantics.md), [failure model](docs/fai
 
 ## Limits of this slice
 
-One Control Plane, no HA; no frontend or pipelines/DAGs. No authentication or TLS: HTTP/gRPC are for trusted local development, with host bindings restricted to loopback. Workers require privileged access to the Docker daemon; this is not a hostile multi-tenant sandbox. Workload containers themselves are non-privileged.
+One Control Plane, no HA; static DAGs are bounded to 128 jobs/2,048 edges. No frontend, authentication, or TLS: HTTP/gRPC are for trusted local development with loopback host bindings. Workers require Docker daemon access; this is not a hostile multi-tenant sandbox. Workload containers are non-privileged. Pipeline coordination is deliberately serialized; no scale claim is made. Control Plane/workers upgrade together for execution-budget ACKs.
 
 A process crash can leave a physical container running. Startup reconciliation removes older-session containers for the same worker identity on the accessible daemon; inaccessible machines cannot be remotely cleaned up. Local cancellation attempts Docker removal with a bounded timeout and logs failures, so physical shutdown cannot be guaranteed when the daemon is unavailable. A permanently lost worker's container may require manual removal using its ForgeGrid labels.
 
-Log delivery has a bounded in-memory queue and bounded retries with persistence ACKs. Abrupt worker crashes or cancellation can lose logs that were not acknowledged; there is no durable worker spool or browser streaming. Each chunk is bounded, but total log storage has no retention policy yet. Logs are diagnostic and may be appended for old attempts with valid immutable identity. Structured process logs are implemented; Prometheus/OpenTelemetry instrumentation is deferred. Submission has no idempotency key in this single-job slice. Public cancellation, authentication, secrets, integrations, and the later architecture gates are not implemented.
+Log delivery has a bounded in-memory queue/retries with persistence ACKs. Crashes/cancellation can lose unacknowledged logs; there is no durable spool/browser streaming or total storage retention policy. Old immutable attempt logs remain diagnostic. Structured process logs are implemented; Prometheus/OpenTelemetry infrastructure is deferred. Submission idempotency keys, DAG mutation, dynamic DAGs, matrix, expressions, fail-fast, artifacts, authentication, secrets, and integrations remain deferred. Public job/pipeline cancellation is implemented.

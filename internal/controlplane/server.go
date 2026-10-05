@@ -113,18 +113,39 @@ func (s *Server) Connect(stream pb.WorkerControl_ConnectServer) error {
 		}
 	}()
 	slog.Info("worker registered", "worker_id", r.WorkerId, "worker_session_id", r.WorkerSessionId)
-	for {
-		msg, e := stream.Recv()
-		if e != nil {
-			return e
+	type received struct {
+		message *pb.WorkerMessage
+		err     error
+	}
+	incoming := make(chan received, 1)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			select {
+			case incoming <- received{msg, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
 		}
+	}()
+	for {
+		var msg *pb.WorkerMessage
 		select {
-		case e = <-sendErrors:
+		case e := <-sendErrors:
 			return e
-		default:
+		case <-ctx.Done():
+			return ctx.Err()
+		case v := <-incoming:
+			if v.err != nil {
+				return v.err
+			}
+			msg = v.message
 		}
 		opctx, done := context.WithTimeout(ctx, 5*time.Second)
-		e = s.handle(opctx, r.WorkerSessionId, msg)
+		e := s.handle(opctx, r.WorkerSessionId, msg)
 		done()
 		if e != nil {
 			return e
@@ -169,14 +190,18 @@ func (s *Server) handle(ctx context.Context, session string, msg *pb.WorkerMessa
 	if action != "" {
 		ttl, err := s.Store.Advance(ctx, id, action)
 		if err != nil {
-			if errors.Is(err, domain.ErrStale) || errors.Is(err, domain.ErrSession) || errors.Is(err, domain.ErrCancelled) {
+			if errors.Is(err, domain.ErrStale) || errors.Is(err, domain.ErrSession) || errors.Is(err, domain.ErrCancelled) || errors.Is(err, domain.ErrTimeout) {
 				s.send(session, &pb.ControlMessage{Body: &pb.ControlMessage_CancelAttempt{CancelAttempt: &pb.CancelAttempt{Identity: pi, Reason: err.Error()}}})
 				return nil
 			}
 			return err
 		}
 		if action == "renew" {
-			if !s.send(session, &pb.ControlMessage{Body: &pb.ControlMessage_LeaseRenewed{LeaseRenewed: &pb.LeaseRenewed{Identity: pi, RequestId: msg.GetLeaseRenewRequest().RequestId, TtlMs: ttl.Milliseconds()}}}) {
+			budget, err := s.Store.ExecutionBudget(ctx, id)
+			if err != nil {
+				return err
+			}
+			if !s.send(session, &pb.ControlMessage{Body: &pb.ControlMessage_LeaseRenewed{LeaseRenewed: &pb.LeaseRenewed{Identity: pi, RequestId: msg.GetLeaseRenewRequest().RequestId, TtlMs: ttl.Milliseconds(), ExecutionBudgetMs: budget}}}) {
 				return status.Error(codes.Unavailable, "control queue full")
 			}
 		}
@@ -213,7 +238,7 @@ func (s *Server) ReportResult(ctx context.Context, r *pb.AttemptResult) (*pb.Res
 	dup, err := s.Store.Complete(ctx, id, result)
 	ack := &pb.ResultAck{Identity: r.Identity, Accepted: err == nil, Duplicate: dup}
 	if err != nil {
-		if !errors.Is(err, domain.ErrStale) && !errors.Is(err, domain.ErrConflict) && !errors.Is(err, domain.ErrSession) && !errors.Is(err, domain.ErrCancelled) {
+		if !errors.Is(err, domain.ErrStale) && !errors.Is(err, domain.ErrConflict) && !errors.Is(err, domain.ErrSession) && !errors.Is(err, domain.ErrCancelled) && !errors.Is(err, domain.ErrTimeout) {
 			return nil, status.Error(codes.Unavailable, "database transition failed")
 		}
 		ack.Error = err.Error()
@@ -232,7 +257,7 @@ func (s *Server) attach(session string) chan *pb.ControlMessage {
 	return outgoing
 }
 
-// Internal only; there is deliberately no HTTP or public gRPC cancel endpoint.
+// Persist cancellation before sending its best-effort notification.
 func (s *Server) cancelJob(ctx context.Context, jobID string) error {
 	id, err := s.Store.Cancel(ctx, jobID)
 	if err != nil {
@@ -282,6 +307,13 @@ func (s *Server) Run(ctx context.Context) {
 			cancel()
 			continue
 		}
+		if expired, err := s.Store.ExpiredExecutions(iteration); err != nil {
+			slog.Error("timeout inspection failed", "error", err)
+		} else {
+			for _, id := range expired {
+				s.send(id.SessionID, &pb.ControlMessage{Body: &pb.ControlMessage_CancelAttempt{CancelAttempt: &pb.CancelAttempt{Identity: wire(id), Reason: domain.ErrTimeout.Error()}}})
+			}
+		}
 		for n := 0; n < 64; n++ {
 			a, err := s.Store.Schedule(iteration, s.connected())
 			if err != nil {
@@ -307,6 +339,7 @@ func jsonResponse(w http.ResponseWriter, code int, v any) {
 }
 func (s *Server) HTTP() http.Handler {
 	mux := http.NewServeMux()
+	s.pipelineRoutes(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := s.Store.Pool.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", 503)

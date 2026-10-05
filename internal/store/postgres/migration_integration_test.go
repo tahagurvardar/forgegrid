@@ -39,7 +39,7 @@ func TestUpgradeAndIdempotentCancellationMigration(t *testing.T) {
 		t.Fatalf("upgraded cancellation: %+v %v", j, err)
 	}
 	var tables int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE'`).Scan(&tables); err != nil || tables != 5 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE'`).Scan(&tables); err != nil || tables != 7 {
 		t.Fatalf("table count=%d %v", tables, err)
 	}
 }

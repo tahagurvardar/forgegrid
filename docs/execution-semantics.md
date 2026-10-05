@@ -16,12 +16,22 @@ Workers begin Docker execution only after their first successful renewal ACK. Fo
 
 Physical execution is at least once. Lease expiry does not prove that a crashed worker's Docker container stopped. Two physical executions can overlap, while only the current valid attempt can produce a PostgreSQL-authoritative terminal winner. Fences protect ForgeGrid state; they do not fence arbitrary external side effects in user workloads.
 
-## Internal cancellation and message ordering
+## Cancellation and message ordering
 
-Cancellation is an internal coordination operation with no public endpoint. It serializes with completion using the same job -> attempt -> session locks. If success commits first, cancellation returns ALREADY_TERMINAL. If cancellation commits first, the job becomes CANCELLING and successful completion returns CANCELLATION_REQUESTED. The current attempt and its slot remain reserved; cancellation itself neither transfers ownership nor decrements capacity. Further renewals are rejected. An unstarted QUEUED/RETRY_WAIT job becomes CANCELLED directly.
+HTTP job and pipeline cancellation reuse the authoritative primitive. It serializes with completion using job -> attempt -> session locks (pipeline operations acquire their outer gate first). Success committing first returns ALREADY_TERMINAL to cancellation. Cancellation committing first sets CANCELLING and invalidates successful completion. The current attempt and slot stay reserved; cancellation neither transfers ownership nor decrements capacity. Renewals are rejected. BLOCKED/QUEUED/RETRY_WAIT jobs become CANCELLED directly.
 
 After receiving CancelAttempt with reason CANCELLATION_REQUESTED, the worker cancels its executor, waits for executor return/cleanup and log draining, then reports CANCELLED, exit_code=-1, failure_kind=JOB_CANCELLED. A delayed renewal ACK cannot start or extend cancelled execution. The authoritative ACK requires the current attempt, matching fence/session, active state, ONLINE session, and valid lease. Duplicate cancelled results release no additional slot. If no valid ACK arrives, expiry records LOST and terminal job CANCELLED, releases the slot once, and suppresses retries. Cleanup is best effort when Docker is unavailable; authoritative cancellation does not guarantee remote physical shutdown.
 
 The validity check after all ownership locks is the linearization point. A completion that passed it before expiry can commit after expiry while retaining those locks; the scanner skips that locked job and cannot install another owner. A request that obtains the locks after expiry is rejected even if the scanner has not run.
 
 Registered precedes every assignment on a newly published stream. A new authoritative assignment may arrive before the previous completion ACK because the database releases capacity before transport delivery. Workers accept it only after the previous physical executor and log draining have finished, and ignore the delayed previous ACK by identity.
+
+## Static pipelines and execution budgets
+
+Pipeline transitions acquire the PostgreSQL pipeline row and all its jobs in ID order before attempt/session locks. Dependency release, fixed-point skips, and aggregation commit with parent terminal transitions. BLOCKED children queue only after all logical parents succeed; retry states prevent premature skips. Permanently failed/cancelled/skipped parents skip unresolved descendants. Independent branches continue.
+
+Pipelines finalize only after every job is terminal. Whole-pipeline cancellation intent yields CANCELLED; otherwise failure takes precedence over individual cancellation, then all-success yields SUCCEEDED. Whole cancellation atomically cancels all nonterminal jobs and waits for active reservations to stop or expire.
+
+Each attempt's write-once execution_deadline_at begins at initial renewal (start fallback). It excludes queue/dependency wait and includes Docker preparation, execution, cleanup/log draining, and accepted reporting. Lease ACKs carry separate execution_budget_ms; workers derive a monotonic execution timer from request-send time, never extended by renewal. Exhausted initial ACK cannot start execution. Completion independently rejects late success as EXECUTION_TIMEOUT; a timeout stop ACK still needs a valid lease. Without it, recovery waits for expiry, records TIMED_OUT/JOB_TIMEOUT, and suppresses workload retry. Committed cancellation overrides timeout during recovery. Lease expiry before its budget retains normal bounded infrastructure retry.
+
+The [pipeline audit](pipeline-semantics-audit.md) defines exact precedence, boundaries, conservative reporting behavior, and test evidence. Workers/Control Plane upgrade together: zero execution budget means exhausted.

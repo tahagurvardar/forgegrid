@@ -1021,6 +1021,8 @@ valid timeout
 
 Invalid DAGs are rejected before persistence as runnable pipelines.
 
+Milestone 3 implements this static model with bounded submissions (128 jobs, 2,048 edges). Concrete transaction, timeout, cancellation, and terminal-state rules are recorded in [pipeline-semantics-audit.md](pipeline-semantics-audit.md). Later presentation/observability gates remain deferred.
+
 ---
 
 # 27. Dependency Semantics
@@ -1053,6 +1055,8 @@ BLOCKED → SKIPPED
 
 Independent branches continue.
 
+Required cancelled/skipped parents also propagate SKIPPED through unresolved descendants. Retryable logical parents remain nonterminal until success or exhaustion; historical failed attempts do not cause premature skips.
+
 V1 does not implement pipeline-wide fail-fast semantics.
 
 ---
@@ -1075,6 +1079,8 @@ pipeline cancellation
 ```
 
 `SKIPPED` downstream jobs do not convert a failed pipeline into success.
+
+The implemented coordinator uses a PostgreSQL pipeline row gate before ordered job locks, then preserves job → attempt → worker-session locking. Attempt finalization, dependency propagation, and aggregation commit together. Whole-pipeline cancellation stays CANCELLING until all jobs terminate and yields CANCELLED. Without whole-pipeline intent, failure takes precedence over individual cancellation, then all-success yields SUCCEEDED.
 
 ---
 
@@ -1248,6 +1254,8 @@ lease_expires_at
 assigned_at
 started_at
 finished_at
+
+execution_deadline_at
 
 exit_code
 

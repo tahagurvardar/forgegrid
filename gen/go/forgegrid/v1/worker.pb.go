@@ -681,13 +681,15 @@ func (x *RunAttempt) GetTimeoutSeconds() int32 {
 
 // The worker computes its monotonic deadline from request-send time, not ACK-receive time.
 // This conservatively accounts for network/queue delay without synchronized wall clocks.
+// Separate remaining execution budget; renewals never extend the job timeout.
 type LeaseRenewed struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Identity      *AttemptIdentity       `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`
-	RequestId     uint64                 `protobuf:"varint,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	TtlMs         int64                  `protobuf:"varint,3,opt,name=ttl_ms,json=ttlMs,proto3" json:"ttl_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Identity          *AttemptIdentity       `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`
+	RequestId         uint64                 `protobuf:"varint,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	TtlMs             int64                  `protobuf:"varint,3,opt,name=ttl_ms,json=ttlMs,proto3" json:"ttl_ms,omitempty"`
+	ExecutionBudgetMs int64                  `protobuf:"varint,4,opt,name=execution_budget_ms,json=executionBudgetMs,proto3" json:"execution_budget_ms,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *LeaseRenewed) Reset() {
@@ -737,6 +739,13 @@ func (x *LeaseRenewed) GetRequestId() uint64 {
 func (x *LeaseRenewed) GetTtlMs() int64 {
 	if x != nil {
 		return x.TtlMs
+	}
+	return 0
+}
+
+func (x *LeaseRenewed) GetExecutionBudgetMs() int64 {
+	if x != nil {
+		return x.ExecutionBudgetMs
 	}
 	return 0
 }
@@ -1153,12 +1162,13 @@ const file_forgegrid_v1_worker_proto_rawDesc = "" +
 	"\x0eattempt_number\x18\x03 \x01(\x05R\rattemptNumber\x12\x14\n" +
 	"\x05image\x18\x04 \x01(\tR\x05image\x12\x18\n" +
 	"\acommand\x18\x05 \x03(\tR\acommand\x12'\n" +
-	"\x0ftimeout_seconds\x18\x06 \x01(\x05R\x0etimeoutSeconds\"\x7f\n" +
+	"\x0ftimeout_seconds\x18\x06 \x01(\x05R\x0etimeoutSeconds\"\xaf\x01\n" +
 	"\fLeaseRenewed\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x02 \x01(\x04R\trequestId\x12\x15\n" +
-	"\x06ttl_ms\x18\x03 \x01(\x03R\x05ttlMs\"\x96\x01\n" +
+	"\x06ttl_ms\x18\x03 \x01(\x03R\x05ttlMs\x12.\n" +
+	"\x13execution_budget_ms\x18\x04 \x01(\x03R\x11executionBudgetMs\"\x96\x01\n" +
 	"\tResultAck\x129\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1d.forgegrid.v1.AttemptIdentityR\bidentity\x12\x1a\n" +
 	"\baccepted\x18\x02 \x01(\bR\baccepted\x12\x1c\n" +

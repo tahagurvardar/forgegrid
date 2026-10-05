@@ -26,6 +26,7 @@ type activeAttempt struct {
 	lastReport      time.Time
 	lost            bool
 	cancelRequested bool
+	stopState       string
 }
 
 func same(a, b *pb.AttemptIdentity) bool {
@@ -200,7 +201,7 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 				return errors.New("lease authority lost")
 			}
 			if active.cancelRequested {
-				result = domain.Result{State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
+				result = stoppedResult(active.stopState)
 			}
 			active.result = &pb.AttemptResult{Identity: active.assignment.Identity, State: result.State, ExitCode: result.ExitCode, FailureKind: result.FailureKind, Detail: domain.BoundedDetail(result.Detail)}
 			slog.Info("execution finished", "attempt_id", active.assignment.Identity.AttemptId, "state", result.State, "exit_code", result.ExitCode)
@@ -238,8 +239,19 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 				}
 				active.deadline = deadline
 				if !active.started {
+					executionDeadline := active.sent.Add(time.Duration(ack.ExecutionBudgetMs) * time.Millisecond)
+					if ack.ExecutionBudgetMs <= 0 || !time.Now().Before(executionDeadline) {
+						active.cancelRequested = true
+						active.stopState = "TIMED_OUT"
+						r := stoppedResult("TIMED_OUT")
+						active.result = &pb.AttemptResult{Identity: active.assignment.Identity, State: r.State, ExitCode: r.ExitCode, FailureKind: r.FailureKind}
+						continue
+					}
 					active.started = true
-					runctx, stop := context.WithTimeout(ctx, time.Duration(active.assignment.TimeoutSeconds)*time.Second)
+					if payloadLimit := time.Now().Add(time.Duration(active.assignment.TimeoutSeconds) * time.Second); payloadLimit.Before(executionDeadline) {
+						executionDeadline = payloadLimit
+					}
+					runctx, stop := context.WithDeadline(ctx, executionDeadline)
 					active.cancel = stop
 					a := active.assignment
 					go func() {
@@ -259,17 +271,24 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 			case msg.GetCancelAttempt() != nil:
 				c := msg.GetCancelAttempt()
 				if active != nil && same(active.assignment.Identity, c.Identity) {
-					if c.Reason == domain.ErrCancelled.Error() {
+					if c.Reason == domain.ErrCancelled.Error() || c.Reason == domain.ErrTimeout.Error() {
 						active.cancelRequested = true
+						if c.Reason == domain.ErrCancelled.Error() {
+							active.stopState = "CANCELLED"
+						} else if active.stopState != "CANCELLED" {
+							active.stopState = "TIMED_OUT"
+						}
 						if active.cancel != nil {
 							active.cancel()
 						}
 						if active.result != nil {
-							active.result = &pb.AttemptResult{Identity: c.Identity, State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
+							r := stoppedResult(active.stopState)
+							active.result = &pb.AttemptResult{Identity: c.Identity, State: r.State, ExitCode: r.ExitCode, FailureKind: r.FailureKind}
 							active.lastReport = time.Time{}
 						}
 						if !active.started {
-							active.result = &pb.AttemptResult{Identity: c.Identity, State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
+							r := stoppedResult(active.stopState)
+							active.result = &pb.AttemptResult{Identity: c.Identity, State: r.State, ExitCode: r.ExitCode, FailureKind: r.FailureKind}
 						}
 						continue
 					}
@@ -286,4 +305,10 @@ func runSession(ctx context.Context, address, worker, session string, renewInter
 			}
 		}
 	}
+}
+func stoppedResult(state string) domain.Result {
+	if state == "TIMED_OUT" {
+		return domain.Result{State: "TIMED_OUT", ExitCode: -1, FailureKind: "JOB_TIMEOUT"}
+	}
+	return domain.Result{State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
 }
