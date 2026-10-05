@@ -40,6 +40,7 @@ func TestRetryPolicy(t *testing.T) {
 		{Result{State: "FAILED", FailureKind: "EXECUTOR_INFRA_ERROR"}, 2, 2, "FAILED"},
 		{Result{State: "FAILED", FailureKind: "EXIT_NON_ZERO"}, 1, 2, "FAILED"},
 		{Result{State: "TIMED_OUT", FailureKind: "JOB_TIMEOUT"}, 1, 2, "FAILED"},
+		{Result{State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}, 1, 2, "CANCELLED"},
 	} {
 		if got := NextJobState(c.n, c.max, c.r); got != c.want {
 			t.Fatalf("got %s want %s", got, c.want)
@@ -47,6 +48,16 @@ func TestRetryPolicy(t *testing.T) {
 	}
 	if RetryDelay(100, time.Second) != 30*time.Second {
 		t.Fatal("unbounded backoff")
+	}
+}
+func TestCancellationResultValidation(t *testing.T) {
+	if err := (Result{State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []Result{{State: "CANCELLED", FailureKind: "JOB_CANCELLED"}, {State: "CANCELLED", ExitCode: -1, FailureKind: "EXECUTOR_INFRA_ERROR"}} {
+		if r.Validate() == nil {
+			t.Fatal("invalid cancellation acknowledgement accepted")
+		}
 	}
 }
 func TestSpecValidation(t *testing.T) {

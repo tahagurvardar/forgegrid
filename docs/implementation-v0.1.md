@@ -13,3 +13,13 @@ Architectural source: docs/architecture-v0.1.md, read completely before implemen
 9. Dockerized Go/protoc tooling supports this Windows repository without host tool installation. PostgreSQL integration tests create isolated schemas; normal/recovery/lease-guard scripts test real processes and containers. No UI or deferred architecture gates were added.
 
 The architecture's metrics/tracing, browser SSE, public cancellation, DAGs, and other later gates remain deferred. This document records slice choices; it does not replace the architectural source of truth.
+
+## Gate C correctness decisions
+
+The pre-change classification and regression evidence are in [correctness-audit.md](correctness-audit.md). No architectural blocker was found. PostgreSQL coordination, fencing, independent liveness/lease checks, bounded retry policy, and the ownership lock order are unchanged.
+
+- Registered is queued before a stream becomes visible to scheduling. A physically finished execution with drained logs can accept the next PostgreSQL-authorized assignment while its old result ACK is delayed; old ACKs cannot clear the new attempt.
+- The architecture's cancellation/completion race is implemented as an internal Store.Cancel primitive only. Migration 002 adds cancel_requested_at and CANCELLING/CANCELLED states without adding tables. Cancellation locks job -> attempt -> session. Active cancellation retains ownership and capacity until a valid cancelled-execution result or lease-expiry recovery; it disables renewals and never retries. A queued job cancels directly. Public cancellation remains deferred.
+- Workers ignore renewal ACKs received after cancellation intent. A cancellation ACK follows executor return and cleanup attempts, including log draining; Docker shutdown remains best effort if its daemon cannot be reached.
+- Tests order transactions with PostgreSQL triggers, advisory barriers, and observed lock waits. Injected write failures and deferred constraint-trigger failures test full rollback, including commit-time failure. These hooks exist only in isolated test schemas, not in production coordination code.
+- Separate test processes run production Control Plane/worker components. SIGKILL and real Docker executions verify exact crash windows, physical orphan survival/overlap, startup reconciliation, and stale result rejection. No fault endpoints or additional infrastructure are introduced.

@@ -42,6 +42,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, migrations.Initial); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(ctx, migrations.InternalCancellation); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 func (s *Store) Submit(ctx context.Context, spec domain.Spec) (string, error) {
@@ -235,6 +238,9 @@ func (s *Store) Advance(ctx context.Context, id domain.Identity, action string) 
 	if !domain.Owns(j, a, id, now) || session != "ONLINE" {
 		return 0, domain.ErrStale
 	}
+	if j.State == "CANCELLING" {
+		return 0, domain.ErrCancelled
+	}
 	var connected bool
 	if err = tx.QueryRow(ctx, `SELECT connected FROM worker_sessions WHERE id=$1`, id.SessionID).Scan(&connected); err != nil {
 		return 0, err
@@ -292,6 +298,12 @@ func (s *Store) Complete(ctx context.Context, id domain.Identity, r domain.Resul
 	if !domain.Owns(j, a, id, now) || session != "ONLINE" {
 		return false, domain.ErrStale
 	}
+	if j.State == "CANCELLING" && r.State != "CANCELLED" {
+		return false, domain.ErrCancelled
+	}
+	if j.State != "CANCELLING" && r.State == "CANCELLED" {
+		return false, domain.ErrConflict
+	}
 	if err = s.finish(ctx, tx, j, a, r); err != nil {
 		return false, err
 	}
@@ -302,11 +314,60 @@ func (s *Store) finish(ctx context.Context, tx pgx.Tx, j domain.Job, a domain.At
 		return err
 	}
 	next := domain.NextJobState(j.AttemptCount, j.MaxAttempts, r)
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET state=$2,retry_available_at=CASE WHEN $2='RETRY_WAIT' THEN clock_timestamp()+$3*interval '1 millisecond' ELSE NULL END,finished_at=CASE WHEN $2 IN ('SUCCEEDED','FAILED') THEN clock_timestamp() ELSE NULL END WHERE id=$1`, j.ID, next, domain.RetryDelay(a.Number, s.RetryBase).Milliseconds()); err != nil {
+	if j.State == "CANCELLING" {
+		next = "CANCELLED"
+	}
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET state=$2,retry_available_at=CASE WHEN $2='RETRY_WAIT' THEN clock_timestamp()+$3*interval '1 millisecond' ELSE NULL END,finished_at=CASE WHEN $2 IN ('SUCCEEDED','FAILED','CANCELLED') THEN clock_timestamp() ELSE NULL END WHERE id=$1`, j.ID, next, domain.RetryDelay(a.Number, s.RetryBase).Milliseconds()); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `UPDATE worker_sessions SET active_slots=active_slots-1 WHERE id=$1`, a.SessionID)
 	return err
+}
+
+// Cancel is an internal coordination primitive. It does not release active
+// ownership or capacity: that waits for a valid stopped-execution ACK or expiry.
+// A committed cancellation request prevents a racing successful completion.
+func (s *Store) Cancel(ctx context.Context, jobID string) (*domain.Identity, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	j, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, jobID))
+	if err != nil {
+		return nil, err
+	}
+	if j.State == "SUCCEEDED" || j.State == "FAILED" || j.State == "CANCELLED" {
+		return nil, domain.ErrTerminal
+	}
+	var identity *domain.Identity
+	next := "CANCELLED"
+	if j.State == "DISPATCHED" || j.State == "RUNNING" || j.State == "CANCELLING" {
+		if j.CurrentAttemptID == nil {
+			return nil, domain.ErrConflict
+		}
+		_, a, _, _, err := lockOwner(ctx, tx, domain.Identity{AttemptID: *j.CurrentAttemptID})
+		if err != nil {
+			return nil, err
+		}
+		if !domain.Active(a.State) {
+			return nil, domain.ErrConflict
+		}
+		i := a.Identity
+		identity = &i
+		next = "CANCELLING"
+		if j.State == "CANCELLING" {
+			return identity, tx.Commit(ctx)
+		}
+	}
+	_, err = tx.Exec(ctx, `UPDATE jobs SET state=$2,cancel_requested_at=clock_timestamp(),retry_available_at=NULL,finished_at=CASE WHEN $2='CANCELLED' THEN clock_timestamp() ELSE NULL END WHERE id=$1`, jobID, next)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return identity, nil
 }
 func (s *Store) Recover(ctx context.Context) error {
 	// Liveness updates never mutate job ownership or release slots.

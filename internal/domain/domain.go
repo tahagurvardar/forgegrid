@@ -10,6 +10,8 @@ import (
 var ErrStale = errors.New("STALE_ATTEMPT")
 var ErrSession = errors.New("INVALID_SESSION")
 var ErrConflict = errors.New("CONFLICTING_COMPLETION")
+var ErrCancelled = errors.New("CANCELLATION_REQUESTED")
+var ErrTerminal = errors.New("ALREADY_TERMINAL")
 
 type Spec struct {
 	Image          string   `json:"image"`
@@ -97,6 +99,10 @@ func (r Result) Validate() error {
 		if r.FailureKind != "JOB_TIMEOUT" {
 			return errors.New("invalid timeout")
 		}
+	case "CANCELLED":
+		if r.FailureKind != "JOB_CANCELLED" || r.ExitCode != -1 {
+			return errors.New("invalid cancellation acknowledgement")
+		}
 	default:
 		return errors.New("invalid terminal result")
 	}
@@ -110,6 +116,9 @@ func Retryable(kind string) bool {
 	return kind == "EXECUTOR_INFRA_ERROR" || kind == "ASSIGNMENT_REJECTED" || kind == "LEASE_EXPIRED"
 }
 func NextJobState(attempts, max int, result Result) string {
+	if result.State == "CANCELLED" {
+		return "CANCELLED"
+	}
 	if result.State == "SUCCEEDED" {
 		return "SUCCEEDED"
 	}

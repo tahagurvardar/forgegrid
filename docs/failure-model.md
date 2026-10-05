@@ -13,7 +13,15 @@
 | Docker unavailable | Executor infrastructure failure may retry, within max_attempts. Container cleanup is best effort and separately bounded. |
 | Workload exits nonzero / invalid executable / timeout | Attempt FAILED / FAILED / TIMED_OUT; job FAILED; no workload retry. |
 | Log RPC fails | Chunk is resent with the same identity and sequence. Duplicate insert does nothing. After bounded delivery failures, execution is cancelled and reported as infrastructure failure if its lease is still valid. |
+| Recovery and completion contend | Shared ownership locks serialize transitions. Expired completion is independently rejected; a valid completion holding the job lock cannot be overwritten by recovery. |
+| Renewal and completion contend | Renewal first may extend the active lease, then completion may win. Completion first makes a later renewal stale; it cannot renew a terminal attempt. |
+| Internal cancellation and success contend | First committed transition wins. Cancellation retains the slot until a valid stop ACK or expiry, rejects renewal/success, and never retries. |
+| AttemptStarted not persisted before Control Plane crash | ASSIGNED still owns the committed lease. A started Docker container does not imply the start transaction committed; recovery waits for expiry. |
+| Transaction write or commit fails | PostgreSQL rolls back that transition's attempt, job, and slot changes together. No rolled-back assignment is delivered. Offline marking and retry requeueing are separate transactions, not one all-or-nothing recovery batch. |
+| Next assignment overtakes old result ACK | Once its previous executor/log drain finished, the worker accepts the new authoritative assignment; delayed old ACKs cannot clear it. |
 
 Docker owns job containers independently of the agent process. SIGKILL removes the worker-side lease guard but can leave the job alive. All containers have worker ID, session ID, job ID, attempt ID, and fencing token labels. New process sessions reconcile containers from older sessions of their worker identity. Containers on permanently inaccessible hosts cannot be remotely stopped. Buffer contents disappear on process crash; acknowledged log chunks remain durable in PostgreSQL.
 
 Run `scripts/demo-recovery.ps1` for the worker-b -> worker-c proof, including delayed result replay. Run `scripts/test-leaseguard.ps1` to stop the Control Plane and prove the live worker cancels without renewal ACKs. Integration tests additionally exercise scheduling/completion concurrency, supersession, and lease expiry during a real row-lock wait.
+
+Run `scripts/verify-recovery.ps1` for isolated-schema, separate-process crash tests: commit before dispatch, Docker start before persisted AttemptStarted, worker SIGKILL with a surviving container and overlapping retry, fresh-session orphan reconciliation, and cancellation of a real Docker execution. Tests kill only their own helper processes and remove only containers labelled with their unique worker IDs. Their PostgreSQL barriers select the crash windows explicitly; they do not depend on guessing transaction timing.

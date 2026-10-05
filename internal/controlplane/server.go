@@ -87,10 +87,7 @@ func (s *Server) Connect(stream pb.WorkerControl_ConnectServer) error {
 	}
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
-	outgoing := make(chan *pb.ControlMessage, 32)
-	s.mu.Lock()
-	s.streams[r.WorkerSessionId] = outgoing
-	s.mu.Unlock()
+	outgoing := s.attach(r.WorkerSessionId)
 	defer func() {
 		s.mu.Lock()
 		delete(s.streams, r.WorkerSessionId)
@@ -115,7 +112,6 @@ func (s *Server) Connect(stream pb.WorkerControl_ConnectServer) error {
 			}
 		}
 	}()
-	outgoing <- &pb.ControlMessage{Body: &pb.ControlMessage_Registered{Registered: &pb.Registered{WorkerSessionId: r.WorkerSessionId, HeartbeatIntervalMs: s.Heartbeat.Milliseconds()}}}
 	slog.Info("worker registered", "worker_id", r.WorkerId, "worker_session_id", r.WorkerSessionId)
 	for {
 		msg, e := stream.Recv()
@@ -173,7 +169,7 @@ func (s *Server) handle(ctx context.Context, session string, msg *pb.WorkerMessa
 	if action != "" {
 		ttl, err := s.Store.Advance(ctx, id, action)
 		if err != nil {
-			if errors.Is(err, domain.ErrStale) || errors.Is(err, domain.ErrSession) {
+			if errors.Is(err, domain.ErrStale) || errors.Is(err, domain.ErrSession) || errors.Is(err, domain.ErrCancelled) {
 				s.send(session, &pb.ControlMessage{Body: &pb.ControlMessage_CancelAttempt{CancelAttempt: &pb.CancelAttempt{Identity: pi, Reason: err.Error()}}})
 				return nil
 			}
@@ -217,13 +213,35 @@ func (s *Server) ReportResult(ctx context.Context, r *pb.AttemptResult) (*pb.Res
 	dup, err := s.Store.Complete(ctx, id, result)
 	ack := &pb.ResultAck{Identity: r.Identity, Accepted: err == nil, Duplicate: dup}
 	if err != nil {
-		if !errors.Is(err, domain.ErrStale) && !errors.Is(err, domain.ErrConflict) && !errors.Is(err, domain.ErrSession) {
+		if !errors.Is(err, domain.ErrStale) && !errors.Is(err, domain.ErrConflict) && !errors.Is(err, domain.ErrSession) && !errors.Is(err, domain.ErrCancelled) {
 			return nil, status.Error(codes.Unavailable, "database transition failed")
 		}
 		ack.Error = err.Error()
 	}
 	slog.Info("attempt result", "attempt_id", id.AttemptID, "fencing_token", id.FencingToken, "worker_session_id", id.SessionID, "accepted", ack.Accepted, "duplicate", dup, "error", ack.Error)
 	return ack, nil
+}
+
+// Queue the registration ACK before making the session visible to schedulers.
+func (s *Server) attach(session string) chan *pb.ControlMessage {
+	outgoing := make(chan *pb.ControlMessage, 32)
+	outgoing <- &pb.ControlMessage{Body: &pb.ControlMessage_Registered{Registered: &pb.Registered{WorkerSessionId: session, HeartbeatIntervalMs: s.Heartbeat.Milliseconds()}}}
+	s.mu.Lock()
+	s.streams[session] = outgoing
+	s.mu.Unlock()
+	return outgoing
+}
+
+// Internal only; there is deliberately no HTTP or public gRPC cancel endpoint.
+func (s *Server) cancelJob(ctx context.Context, jobID string) error {
+	id, err := s.Store.Cancel(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if id != nil {
+		s.send(id.SessionID, &pb.ControlMessage{Body: &pb.ControlMessage_CancelAttempt{CancelAttempt: &pb.CancelAttempt{Identity: wire(*id), Reason: domain.ErrCancelled.Error()}}})
+	}
+	return nil
 }
 func (s *Server) Stream(stream pb.WorkerLogs_StreamServer) error {
 	for {

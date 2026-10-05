@@ -25,6 +25,7 @@ type activeAttempt struct {
 	result          *pb.AttemptResult
 	lastReport      time.Time
 	lost            bool
+	cancelRequested bool
 }
 
 func same(a, b *pb.AttemptIdentity) bool {
@@ -38,6 +39,12 @@ func Run(ctx context.Context, address, worker string, renewInterval time.Duratio
 	if err != nil {
 		return err
 	}
+	return runSession(ctx, address, worker, session, renewInterval, runAttempt)
+}
+
+// Control-session behavior is independent of the Docker executor. Tests supply
+// a deterministic executor here while retaining real gRPC and PostgreSQL state.
+func runSession(ctx context.Context, address, worker, session string, renewInterval time.Duration, execute func(context.Context, pb.WorkerLogsClient, string, *pb.RunAttempt, func()) domain.Result) error {
 	controlConn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
@@ -116,7 +123,7 @@ func Run(ctx context.Context, address, worker string, renewInterval time.Duratio
 	var request uint64
 	var disconnected error
 	requestRenew := func() {
-		if active == nil || active.pending != 0 || active.lost || disconnected != nil {
+		if active == nil || active.pending != 0 || active.lost || active.cancelRequested || disconnected != nil {
 			return
 		}
 		request++
@@ -192,6 +199,9 @@ func Run(ctx context.Context, address, worker string, renewInterval time.Duratio
 			if active.lost {
 				return errors.New("lease authority lost")
 			}
+			if active.cancelRequested {
+				result = domain.Result{State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
+			}
 			active.result = &pb.AttemptResult{Identity: active.assignment.Identity, State: result.State, ExitCode: result.ExitCode, FailureKind: result.FailureKind, Detail: domain.BoundedDetail(result.Detail)}
 			slog.Info("execution finished", "attempt_id", active.assignment.Identity.AttemptId, "state", result.State, "exit_code", result.ExitCode)
 		case msg := <-incoming:
@@ -205,15 +215,20 @@ func Run(ctx context.Context, address, worker string, renewInterval time.Duratio
 					if same(active.assignment.Identity, a.Identity) {
 						continue
 					}
-					send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AssignmentRejected{AssignmentRejected: &pb.AssignmentRejected{Identity: a.Identity, Reason: "worker capacity occupied"}}})
-					continue
+					if active.result == nil || active.cancel != nil {
+						send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AssignmentRejected{AssignmentRejected: &pb.AssignmentRejected{Identity: a.Identity, Reason: "worker capacity occupied"}}})
+						continue
+					}
+					// A fresh assignment means PostgreSQL has released the old
+					// reservation. Execution and log draining already finished;
+					// a delayed old ACK must not consume the new attempt's retry.
 				}
 				active = &activeAttempt{assignment: a, initialDeadline: time.Now().Add(5 * time.Second)}
 				send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AssignmentAccepted{AssignmentAccepted: a.Identity}})
 				requestRenew()
 			case msg.GetLeaseRenewed() != nil:
 				ack := msg.GetLeaseRenewed()
-				if active == nil || active.lost || !same(active.assignment.Identity, ack.Identity) || ack.RequestId != active.pending || active.pending == 0 {
+				if active == nil || active.lost || active.cancelRequested || !same(active.assignment.Identity, ack.Identity) || ack.RequestId != active.pending || active.pending == 0 {
 					continue
 				}
 				active.pending = 0
@@ -228,7 +243,7 @@ func Run(ctx context.Context, address, worker string, renewInterval time.Duratio
 					active.cancel = stop
 					a := active.assignment
 					go func() {
-						r := runAttempt(runctx, pb.NewWorkerLogsClient(logConn), worker, a, func() { send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AttemptStarted{AttemptStarted: a.Identity}}) })
+						r := execute(runctx, pb.NewWorkerLogsClient(logConn), worker, a, func() { send(&pb.WorkerMessage{Body: &pb.WorkerMessage_AttemptStarted{AttemptStarted: a.Identity}}) })
 						stop()
 						results <- r
 					}()
@@ -244,6 +259,20 @@ func Run(ctx context.Context, address, worker string, renewInterval time.Duratio
 			case msg.GetCancelAttempt() != nil:
 				c := msg.GetCancelAttempt()
 				if active != nil && same(active.assignment.Identity, c.Identity) {
+					if c.Reason == domain.ErrCancelled.Error() {
+						active.cancelRequested = true
+						if active.cancel != nil {
+							active.cancel()
+						}
+						if active.result != nil {
+							active.result = &pb.AttemptResult{Identity: c.Identity, State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
+							active.lastReport = time.Time{}
+						}
+						if !active.started {
+							active.result = &pb.AttemptResult{Identity: c.Identity, State: "CANCELLED", ExitCode: -1, FailureKind: "JOB_CANCELLED"}
+						}
+						continue
+					}
 					active.lost = true
 					if active.cancel != nil {
 						active.cancel()

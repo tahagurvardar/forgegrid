@@ -45,11 +45,14 @@ docker compose down
 ```powershell
 ./scripts/verify.ps1
 ./scripts/verify-e2e.ps1
+./scripts/verify-recovery.ps1
 ./scripts/demo-recovery.ps1
 ./scripts/test-leaseguard.ps1
 ```
 
 `verify.ps1` checks gofmt, go vet, compilation, unit tests, and race-enabled integration tests against real PostgreSQL. Integration tests use a unique schema per test and remove only that schema. Explicitly requested integration tests fail if `TEST_DATABASE_URL` is missing. `verify-e2e.ps1` tests real Docker execution, stdout/stderr persistence, duplicate result/log delivery, stale fencing, nonzero exit, invalid command, and timeout. The lease-guard script stops the Control Plane, proves the old job container stops without renewal ACKs, then checks recovery after restart.
+
+`verify-recovery.ps1` mounts the Docker socket into the development test runner and tests real process deaths at exact assignment/start windows, surviving and overlapping Docker executions, orphan reconciliation, and internal cancellation. It uses isolated database schemas and unique worker/container labels. All verification scripts disable Go test result caching. See the [Gate C audit and coverage matrix](docs/correctness-audit.md) for deterministic transaction races and injected rollback cases.
 
 With a local Go toolchain:
 
@@ -72,7 +75,7 @@ Regenerate the committed Protobuf Go bindings:
 - `cmd/controlplane`, `internal/controlplane`: HTTP/gRPC gateway, transactional scheduling, heartbeat detection, and lease recovery in one process.
 - `cmd/worker`, `internal/worker`: process session UUID, heartbeats, renewal requests, monotonic lease guard, Docker CLI executor, log collector, and startup reconciliation.
 - `internal/domain`: ownership checks, specification validation, result classification, and capped infrastructure retry policy.
-- `internal/store/postgres`, `db/migrations`: explicit pgx SQL, row locks, durable attempts, reserved capacity, and duplicate-safe log chunks. The embedded initial migration runs transactionally under a PostgreSQL advisory lock; it is idempotent and introduces only the five slice tables.
+- `internal/store/postgres`, `db/migrations`: explicit pgx SQL, row locks, durable attempts, reserved capacity, and duplicate-safe log chunks. Embedded migrations run transactionally under a PostgreSQL advisory lock; migration 002 adds internal cancellation to the original five tables. Reapplication and upgrade from the initial schema are tested.
 - `api/proto/forgegrid/v1`, `gen/go`: versioned contracts and generated bindings.
 - `tests`, `scripts`: Docker end-to-end checks, diagnostic result replay, and repeatable demos.
 
