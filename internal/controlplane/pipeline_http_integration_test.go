@@ -9,9 +9,61 @@ import (
 	"forgegrid/internal/store/postgres"
 	"forgegrid/internal/testutil"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 )
+
+func TestPublicSkippedJobCancellationIsReadOnlyConflict(t *testing.T) {
+	pool, ctx := testutil.Database(t)
+	store := &postgres.Store{Pool: pool, Lease: 10 * time.Second, Offline: 6 * time.Second}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	spec := domain.Spec{Image: "alpine", Command: []string{"true"}, TimeoutSeconds: 30, MaxAttempts: 2}
+	id, err := store.SubmitPipeline(ctx, domain.PipelineSpec{Jobs: []domain.PipelineJobSpec{
+		{Key: "parent", Spec: spec}, {Key: "child", Spec: spec, Dependencies: []string{"parent"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := store.GetPipeline(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parent, child string
+	for _, j := range p.Jobs {
+		if *j.Key == "parent" {
+			parent = j.ID
+		} else {
+			child = j.ID
+		}
+	}
+	if _, err := store.Cancel(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetPipeline(ctx, id)
+	if err != nil || before.State != "CANCELLED" {
+		t.Fatalf("terminal pipeline: %+v %v", before, err)
+	}
+	for _, j := range before.Jobs {
+		if j.ID == child && j.State != "SKIPPED" {
+			t.Fatal("child was not skipped")
+		}
+	}
+	handler := New(store, 2*time.Second).HTTP()
+	for repeat := 0; repeat < 2; repeat++ {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/jobs/"+child+"/cancel", nil))
+		if w.Code != 409 {
+			t.Fatalf("cancel skipped job: %d %s", w.Code, w.Body.String())
+		}
+		after, err := store.GetPipeline(ctx, id)
+		if err != nil || !reflect.DeepEqual(before, after) {
+			t.Fatalf("terminal inspection changed: %+v %v", after, err)
+		}
+	}
+}
 
 func TestPublicPipelineHTTPValidationAndCancellation(t *testing.T) {
 	pool, ctx := testutil.Database(t)

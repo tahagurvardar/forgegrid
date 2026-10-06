@@ -1,4 +1,6 @@
-# Failure model for the first vertical slice
+# Failure model
+
+Implemented behavior through Milestones 1–6. The tables describe authoritative state and best-effort physical cleanup separately; [release-audit.md](release-audit.md) records release verification and intentional nonclaims.
 
 | Failure | Behavior |
 |---|---|

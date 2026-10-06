@@ -52,6 +52,45 @@ func finishKey(t *testing.T, s *Store, ctx context.Context, id, key, session str
 func workloadFailure() domain.Result {
 	return domain.Result{State: "FAILED", ExitCode: 7, FailureKind: "EXIT_NON_ZERO"}
 }
+
+func TestSkippedJobCancellationPreservesTerminalState(t *testing.T) {
+	s, ctx := fixture(t)
+	b := register(t, s, ctx, "worker-b")
+	c := register(t, s, ctx, "worker-c")
+	id := pipeline(t, s, ctx, node("parent"), node("child", "parent"), node("grandchild", "child"), node("independent"))
+	other := claimKey(t, s, ctx, id, "independent", c)
+	finishKey(t, s, ctx, id, "parent", b, workloadFailure())
+	for _, terminal := range []bool{false, true} {
+		if terminal {
+			if _, err := s.Complete(ctx, other.Attempt.Identity, success()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p, jobs := pipelineView(t, s, ctx, id)
+		want := "RUNNING"
+		if terminal {
+			want = "FAILED"
+		}
+		if p.State != want {
+			t.Fatalf("pipeline state: %s, want %s", p.State, want)
+		}
+		before := snapshot(t, s, ctx)
+		for _, key := range []string{"child", "grandchild"} {
+			if jobs[key].State != "SKIPPED" || jobs[key].AttemptCount != 0 {
+				t.Fatalf("expected unexecuted skipped %s: %+v", key, jobs[key])
+			}
+			for repeat := 0; repeat < 2; repeat++ {
+				if identity, err := s.Cancel(ctx, jobs[key].ID); !errors.Is(err, domain.ErrTerminal) || identity != nil {
+					t.Fatalf("cancel skipped %s: %v %v", key, identity, err)
+				}
+				if snapshot(t, s, ctx) != before {
+					t.Fatal("terminal cancellation changed authoritative rows")
+				}
+			}
+		}
+		assertSlots(t, s, ctx)
+	}
+}
 func infraFailure() domain.Result {
 	return domain.Result{State: "FAILED", ExitCode: -1, FailureKind: "EXECUTOR_INFRA_ERROR"}
 }

@@ -34,7 +34,9 @@ func Init(service string) func() {
 	}))
 	opts := []sdktrace.TracerProviderOption{sdktrace.WithSampler(sdktrace.AlwaysSample()), sdktrace.WithResource(resource.NewSchemaless(attribute.String("service.name", service)))}
 	if endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); endpoint != "" && os.Getenv("OTEL_TRACES_EXPORTER") != "none" {
-		exporter, err := otlptracehttp.New(context.Background(), otlptracehttp.WithEndpointURL(endpoint), otlptracehttp.WithTimeout(time.Second), otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}))
+		// Let the SDK append /v1/traces to the generic environment base URL;
+		// WithEndpointURL expects a complete signal URL and would override that path.
+		exporter, err := otlptracehttp.New(context.Background(), otlptracehttp.WithTimeout(time.Second), otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}))
 		if err != nil {
 			slog.Warn("telemetry exporter configuration invalid; export disabled")
 		} else {

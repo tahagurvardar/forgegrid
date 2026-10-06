@@ -1,6 +1,12 @@
 /bin/
 *.exe
 .env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.sqlite
+*.sqlite3
 /frontend/node_modules/
 /frontend/dist/
 /frontend/test-results/

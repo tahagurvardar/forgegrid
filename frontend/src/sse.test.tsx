@@ -22,6 +22,35 @@ class FakeSource {
     this.closed = true;
   }
 }
+
+test("malformed SSE output preserves prior logs and cursor without crashing the console", () => {
+  vi.stubGlobal("EventSource", FakeSource);
+  try {
+    render(<LiveLogs attempt={baseAttempt} />);
+    const source = FakeSource.sources.at(-1)!;
+    const emit = (data: unknown) =>
+      act(() =>
+        source.handler?.(
+          new MessageEvent("chunk", { data: JSON.stringify(data) }),
+        ),
+      );
+    emit({ sequence: 4, stream: "STDOUT", payload: btoa("retained-output") });
+    for (const invalid of [
+      null,
+      { sequence: 5, stream: "STDERR", payload: "%%%" },
+    ]) {
+      expect(() => emit(invalid)).not.toThrow();
+      expect(screen.getByText("Invalid log data")).toBeInTheDocument();
+      expect(screen.getByText("retained-output")).toBeInTheDocument();
+      expect(screen.getByText(/Cursor 4/)).toBeInTheDocument();
+    }
+    emit({ sequence: 5, stream: "STDOUT", payload: btoa("valid-next-chunk") });
+    expect(screen.getByText("valid-next-chunk")).toBeInTheDocument();
+    expect(screen.getByText(/Cursor 5/)).toBeInTheDocument();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
 test("SSE reconnect retains cursor, deduplicates replay, exposes failure and closes on selection change", () => {
   vi.stubGlobal("EventSource", FakeSource);
   const { rerender, unmount } = render(<LiveLogs attempt={baseAttempt} />);

@@ -3,13 +3,92 @@ package observability
 import (
 	"context"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestExporterUsesOTLPSignalPathFromEnvironment(t *testing.T) {
+	for _, c := range []struct {
+		name, basePath, signalPath, want string
+	}{
+		{"base-url", "", "", "/v1/traces"},
+		{"trailing-slash", "/", "", "/v1/traces"},
+		{"base-prefix", "/telemetry", "", "/telemetry/v1/traces"},
+		{"signal-override", "", "/custom/traces", "/custom/traces"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			paths := make(chan string, 1)
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths <- r.URL.Path
+				if r.URL.Path != c.want {
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer backend.Close()
+			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", backend.URL+c.basePath)
+			signal := ""
+			if c.signalPath != "" {
+				signal = backend.URL + c.signalPath
+			}
+			t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", signal)
+			t.Setenv("OTEL_TRACES_EXPORTER", "")
+			old := otel.GetTracerProvider()
+			shutdown := Init("endpoint-test")
+			defer func() { shutdown(); otel.SetTracerProvider(old) }()
+			_, span := Start(context.Background(), "endpoint-proof")
+			span.End()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := otel.GetTracerProvider().(*sdktrace.TracerProvider).ForceFlush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-paths:
+				if got != c.want {
+					t.Fatalf("export path=%s, want %s", got, c.want)
+				}
+			case <-ctx.Done():
+				t.Fatal("export did not reach the HTTP backend")
+			}
+		})
+	}
+}
+
+func TestExporterRejectsOversizedCollectorResponseWithoutRetry(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var requests atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(status)
+				_, _ = w.Write(make([]byte, 8*1024*1024))
+			}))
+			defer backend.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			exporter, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(backend.URL), otlptracehttp.WithTimeout(time.Second), otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer exporter.Shutdown(ctx)
+			err = exporter.ExportSpans(ctx, []sdktrace.ReadOnlySpan{tracetest.SpanStub{Name: "bounded-response"}.Snapshot()})
+			if err == nil || !strings.Contains(err.Error(), "response body too large") {
+				t.Fatalf("oversized collector response was not bounded: %v", err)
+			}
+			if requests.Load() != 1 {
+				t.Fatalf("exporter retried an oversized response: %d requests", requests.Load())
+			}
+		})
+	}
+}
 
 func TestTracePropagationPreservesCancellationAndRejectsMalformedContext(t *testing.T) {
 	provider := sdktrace.NewTracerProvider()

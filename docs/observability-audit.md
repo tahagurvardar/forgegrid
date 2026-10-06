@@ -1,5 +1,7 @@
 # Milestone 4: observability audit
 
+This records Milestone 4 decisions. Later console support and M6 exporter/regression corrections are documented in [operational-console-audit.md](operational-console-audit.md) and [final-engineering-audit.md](final-engineering-audit.md). Current complete verification is in [release-audit.md](release-audit.md).
+
 Source of truth: architecture-v0.1.md, implementation-v0.1.md, correctness-audit.md, pipeline-semantics-audit.md, and the existing protocol/execution/failure documents. Started from clean, pushed `9080fb96d84065bf79c7ee9d9e877aea58921597`.
 
 **Observability is not part of the authoritative state machine.** PostgreSQL, ownership checks, pipeline → ordered jobs → attempts → worker-session locks, fencing, session incarnation, ACK-gated leases, deadlines, bounded retries, cancellation, and DAG decisions remain authoritative. No exporter acknowledgement is required for any transition.
@@ -93,6 +95,6 @@ The failure-isolation script starts/recreates core services with all three backe
 - Existing correctness tests retain their assertions. The legacy migration test now seeds via original-schema SQL because the current Submit API runs after startup migrations; upgrade/reapplication/data-preservation assertions remain.
 - Real Docker demo and backend-loss script complement existing execution, pipeline, lease-guard, and process-crash suites.
 
-Final verification results are recorded after the complete matrix finishes. Observability does not strengthen physical execution guarantees: crashes can leave Docker containers running, physical attempts may overlap, and fences protect PostgreSQL results rather than workload side effects. Frontend, authentication, integrations, brokers, artifacts, secrets, autoscaling, and unrelated infrastructure remain deferred.
+Completed observability verification is recorded in the [final engineering audit](final-engineering-audit.md), and the release matrix is recorded in [release-audit.md](release-audit.md). Observability does not strengthen physical execution guarantees: crashes can leave Docker containers running, physical attempts may overlap, and fences protect PostgreSQL results rather than workload side effects. Frontend, authentication, integrations, brokers, artifacts, secrets, autoscaling, and unrelated infrastructure were deferred at Milestone 4.
 
 Milestone 5 now adds the operational console and links valid persisted attempt trace IDs to local Jaeger. It does not depend on Jaeger or Prometheus availability. The preceding frontend-deferred statement records Milestone 4 scope; see [console semantics](operational-console-audit.md) for the implemented inspection layer.

@@ -287,7 +287,13 @@ export function LiveLogs({ attempt }: { attempt: Attempt }) {
         const chunk = JSON.parse(
           (event as MessageEvent<string>).data,
         ) as LogChunk;
-        setView((v) => ({ ...v, buffer: appendChunk(v.buffer, chunk) }));
+        setView((v) => {
+          try {
+            return { ...v, buffer: appendChunk(v.buffer, chunk) };
+          } catch {
+            return { ...v, status: "Invalid log data" };
+          }
+        });
       } catch {
         setView((v) => ({ ...v, status: "Invalid log data" }));
       }

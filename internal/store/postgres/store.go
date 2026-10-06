@@ -498,7 +498,7 @@ func cancelJob(ctx context.Context, tx pgx.Tx, jobID string) (*domain.Identity, 
 	if err != nil {
 		return nil, err
 	}
-	if j.State == "SUCCEEDED" || j.State == "FAILED" || j.State == "CANCELLED" {
+	if domain.TerminalJob(j.State) {
 		return nil, domain.ErrTerminal
 	}
 	var identity *domain.Identity

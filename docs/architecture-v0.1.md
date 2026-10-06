@@ -4,6 +4,8 @@
 **Primary goal:** Distributed execution correctness under worker failure
 **Non-goal:** Full GitHub Actions / GitLab CI replacement
 
+**Release reading guide (v1.0.0 preparation):** This is the original design specification, preserved with its development gates and conceptual examples. Milestones 1–6 implement and audit the core execution, DAG, observation and console behavior. Runtime details are defined by committed migrations/contracts and [execution semantics](execution-semantics.md); current verified scope, deferred features and final checks are indexed in [release-audit.md](release-audit.md). Conceptual DRAINING, submission idempotency and later roadmap sections are not implemented API guarantees.
+
 ---
 
 ## 1. Product Definition
@@ -1021,7 +1023,7 @@ valid timeout
 
 Invalid DAGs are rejected before persistence as runnable pipelines.
 
-Milestone 3 implements this static model with bounded submissions (128 jobs, 2,048 edges). Concrete transaction, timeout, cancellation, and terminal-state rules are recorded in [pipeline-semantics-audit.md](pipeline-semantics-audit.md). Later presentation/observability gates remain deferred.
+Milestone 3 implements this static model with bounded submissions (128 jobs, 2,048 edges). Concrete transaction, timeout, cancellation, and terminal-state rules are recorded in [pipeline-semantics-audit.md](pipeline-semantics-audit.md). Presentation/observability were deferred at Milestone 3 and implemented in Milestones 4–5.
 
 ---
 
@@ -1175,6 +1177,8 @@ finished_at
 ```
 
 Idempotency behavior:
+
+Implementation status (Milestones 1–5): submission idempotency keys and request hashes are not implemented. The behavior below is a conceptual design, not a current HTTP API guarantee. Repeating a submission can create another pipeline; completion and log-delivery idempotency are implemented separately.
 
 Same key + same request:
 
@@ -1513,7 +1517,7 @@ Any container surviving the dead agent is stale and cannot produce an authoritat
 
 # 45. Observability
 
-Milestone 4 implements this observation layer without adding it to coordination authority. See [observability-audit.md](observability-audit.md) for trace propagation, committed metric snapshots, cardinality, exporter isolation, and evidence. Frontend presentation remains deferred.
+Milestone 4 implements this observation layer without adding it to coordination authority. See [observability-audit.md](observability-audit.md) for trace propagation, committed metric snapshots, cardinality, exporter isolation, and evidence. Frontend presentation was deferred at Milestone 4 and implemented in Milestone 5.
 
 Prometheus metrics should include:
 

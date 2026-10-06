@@ -1,5 +1,7 @@
 # Milestone 5: operational console
 
+This preserves Milestone 5 scope and its original verification counts. M6 adds the malformed-SSE regression (24 unit/component tests) and terminal-SKIPPED cancellation protection. See [final-engineering-audit.md](final-engineering-audit.md) for those findings and [release-audit.md](release-audit.md) for the current complete run.
+
 The React / TypeScript / Vite console observes the existing engine. PostgreSQL and Control Plane APIs remain authoritative. Browser refreshes, navigation, missing telemetry, SSE disconnection and closing the console cannot renew a lease or decide an execution result. No ownership, retry, cancellation, timeout, scheduling, recovery or DAG transition was changed for this milestone.
 
 ## Audit and minimum API additions

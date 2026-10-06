@@ -1,5 +1,7 @@
 # First slice implementation decisions
 
+Historical decision log: each section records scope at that milestone, including features deferred then and implemented later. The original five-table/internal-cancellation statements are not current API limits. For present release scope/evidence, see [release-audit.md](release-audit.md); Milestones 3–5 below record the seven-table DAG, observability and console additions.
+
 Architectural source: docs/architecture-v0.1.md, read completely before implementation. No architectural blocker or product redesign was required.
 
 1. One Go module, two production binaries, one Control Plane. The scheduler and recovery manager are logical functions in the Control Plane package, rather than separate services. A third development-only executable replays stale results for the acceptance demo.

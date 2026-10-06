@@ -1,5 +1,7 @@
 # Milestone 3: pipeline semantics audit
 
+Historical Milestone 3 scope/evidence. Its frontend/observability exclusions describe that stage; Milestones 4–5 subsequently implement those layers. See [release-audit.md](release-audit.md) for current verification and limitations.
+
 Architectural sources: architecture-v0.1.md sections 26–29 and 39–40, implementation-v0.1.md, and the verified Gate C audit. Gate C was checkpointed and pushed as `b295eccab7e2d198105dbdedeba94c1b55bf1910` before implementation. No architectural blocker or additional infrastructure was required.
 
 ## DAG validation and states

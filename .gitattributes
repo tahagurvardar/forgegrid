@@ -1,1 +1,2 @@
 /scripts/verify.sh text eol=lf
+*.png binary

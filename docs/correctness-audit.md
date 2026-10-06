@@ -1,5 +1,7 @@
 # Correctness audit: Gate C
 
+Historical Gate C findings/evidence, retained without rewriting their original classifications. Later milestones add public cancellation, DAGs, observability and console inspection; current scope and verification are in [release-audit.md](release-audit.md).
+
 Audited against architecture-v0.1.md and implementation-v0.1.md before changing code on 2026-10-05. PostgreSQL remains authoritative; the job -> attempt -> session lock order and lease/fencing model are retained. No public product surface is added.
 
 ## Findings before modification

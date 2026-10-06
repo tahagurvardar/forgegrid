@@ -1,4 +1,6 @@
-# Execution semantics for Milestones 1A/1B
+# Execution semantics
+
+Current implemented semantics, extended through DAGs, observability and the operational console. Historical milestone evidence is preserved in the audit documents; [release-audit.md](release-audit.md) records the current full verification.
 
 PostgreSQL is the authority. A job has one current_attempt_id and a monotonically increasing fencing_token. Retries allocate a fresh UUID, increment attempt_number and fencing_token, and preserve prior attempt identities and history. A partial unique index permits at most one ASSIGNED/RUNNING attempt per job. A composite foreign key keeps the current attempt pointer within its own job.
 

@@ -1,8 +1,14 @@
 .git
-bin
 .env
+.env.*
+bin
 *.exe
-frontend/node_modules
-frontend/dist
-frontend/test-results
-frontend/playwright-report
+**/node_modules
+**/dist
+**/test-results
+**/playwright-report
+**/*.log
+**/*.tmp
+docs/assets
+ersPCProjectsforgegrid
+tatus --short

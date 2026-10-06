@@ -1,111 +1,146 @@
 # ForgeGrid
 
-ForgeGrid is a Go distributed job execution engine with static DAG pipelines. The execution/recovery backbone, concurrency milestone, and Milestone 3 pipeline semantics follow [architecture-v0.1](docs/architecture-v0.1.md): PostgreSQL owns coordination state, outbound gRPC connects workers, and Docker executes trusted local jobs.
+**A distributed job execution engine with CI-style static DAG pipelines, built to make execution ownership and worker failure recovery explicit.**
 
-Execution is **at least once physically**, with a single authoritative terminal winner. Killing an agent can leave its Docker job container alive. Lease expiry and fencing prevent that old attempt from finalizing the logical job.
+Go · gRPC/Protobuf · PostgreSQL · Docker · React/TypeScript/Vite · OpenTelemetry · Prometheus · Jaeger
+
+ForgeGrid coordinates outbound gRPC workers and executes argv commands in Docker. Its engineering focus is the interval between a worker disappearing and another worker acquiring authority: heartbeat loss does not transfer ownership, lease expiry does, and fencing prevents a delayed result from replacing the valid winner. PostgreSQL owns that decision; the browser and telemetry observe it.
+
+This is a verified, trusted-local portfolio project, not a full GitHub Actions/GitLab replacement or a production-ready public deployment.
+
+## The signature recovery scenario
+
+```text
+worker-b runs attempt #1 / fence 1
+  → worker-b disappears; heartbeats stop
+  → session becomes OFFLINE; attempt still owns its unexpired lease
+  → lease expires; attempt #1 becomes LOST
+  → bounded retry creates attempt #2 / fence 2
+  → worker-c executes and succeeds
+  → delayed completion from attempt #1 is rejected as stale
+```
+
+The old attempt remains inspectable, including its worker session, fence, failure boundary and retained logs. The real Docker/browser test also verifies that the valid retry releases the dependent job. See the [recovery capture](docs/assets/console/recovery.png), [engineering audit](docs/final-engineering-audit.md) and [reproducible demos](#demos-and-verification).
+
+## Correctness model
+
+- **At-least-once physical execution:** crashes can leave an old Docker container alive; physical attempts can overlap. ForgeGrid does not fence external workload side effects.
+- **One authoritative current attempt per job:** retries allocate a fresh UUID and greater fencing token. A current pointer can retain a terminal historical attempt without granting active authority.
+- **Stale attempts cannot finalize a job:** completion checks attempt identity, fence, current pointer, active state, session and lease, independently of the recovery scanner.
+- **Heartbeat and lease are separate:** liveness uses Control Plane receive time; workers renew authority only on successful ACKs and enforce conservative monotonic deadlines locally.
+- **Bounded retries:** infrastructure loss may retry; nonzero workload exit, invalid executable and workload timeout do not automatically retry. `max_attempts` includes the first execution.
+- **PostgreSQL is authoritative:** explicit transactions, row locks and constraints coordinate assignment, completion, capacity and DAG propagation. Dispatch follows the assignment commit.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Client / Operational Console] -->|HTTP + persisted-log SSE| CP[Control Plane]
+    subgraph PROCESS[Single Control Plane process]
+        CP --> SR[Scheduler / Recovery]
+    end
+    CP <-->|Authoritative transactions| PG[(PostgreSQL)]
+    SR <-->|Claims / leases / DAG transitions| PG
+    W[gRPC Worker Agents] -->|Outbound control + separate log RPCs| CP
+    SR -->|Committed assignments over established stream| W
+    W --> D[Docker Executors]
+    CP -.->|OTLP traces| O[OpenTelemetry Collector]
+    W -.->|OTLP traces| O
+    O -.-> J[Jaeger]
+    P[Prometheus] -.->|Scrape cached metrics| CP
+    P -.->|Scrape worker metrics| W
+```
+
+Dashed paths are observation only. Collector, Jaeger or Prometheus outages do not grant leases, decide retries or block authoritative completion. [Tracing/metrics details](docs/observability-audit.md).
 
 ## Run locally
 
-Requirements: Docker Desktop with its Linux engine running, Docker Compose, and PowerShell 7. Host Go and protoc are optional; development tools run in Docker. Ports 5432, 8080, and 9090 must be available. Initial builds require internet access.
+Requirements: Docker Engine/Desktop with Linux containers, Docker Compose v2, and Windows PowerShell 5.1 or PowerShell 7. Frontend verification/screenshots additionally use Node/npm (Node 24 verified) and Playwright Chromium. Go/protoc tooling runs in Docker; initial builds need internet access.
 
 From the repository root:
 
 ```powershell
-./scripts/demo-normal.ps1
-./scripts/demo-recovery.ps1
-./scripts/demo-pipeline.ps1
-./scripts/demo-pipeline-recovery.ps1
-./scripts/demo-observability.ps1
+docker compose --profile console up -d --build --wait postgres control-plane worker-a worker-b worker-c console otel-collector prometheus jaeger
 ```
 
-The normal demo builds the stack, registers worker-a/b/c, submits an argv job, and asserts PostgreSQL-backed success and both log streams. The recovery demo temporarily stops a/c, starts a fresh worker-b session, kills worker-b with SIGKILL, starts c, observes the offline session while attempt #1 still owns the job, waits for lease expiry, verifies LOST -> attempt #2 on c -> SUCCEEDED, and replays the old result through gRPC. It must print `STALE_ATTEMPT_REJECTED` and `WORKER_B_TO_WORKER_C_RECOVERY_PASSED`. Both demos use the existing local database; run them when no other jobs are being submitted. The recovery demo restores all three workers afterward.
+| Local surface | Address |
+|---|---|
+| Operational console | http://localhost:5173 |
+| HTTP API / health / metrics | http://localhost:8080/api/v1/overview · http://localhost:8080/healthz · http://localhost:8080/metrics |
+| Jaeger | http://localhost:16686 |
+| Prometheus | http://localhost:9092 |
+| PostgreSQL / worker gRPC | Loopback ports 5432 / 9090 |
 
-Start the stack without submitting a demo:
+These ports must be free. The Compose database password is a local development default. Agents access the Docker daemon; run only trusted workloads. There is no authentication/TLS.
 
-```powershell
-docker compose up -d --build --wait postgres control-plane worker-a worker-b worker-c
-```
-
-Submit a job:
+Submit a standalone argv job:
 
 ```powershell
 $body = @{ image = 'alpine:3.22'; command = @('echo', 'hello ForgeGrid'); timeout_seconds = 30; max_attempts = 2 } | ConvertTo-Json
 $job = Invoke-RestMethod http://localhost:8080/api/v1/jobs -Method Post -ContentType application/json -Body $body
 Invoke-RestMethod "http://localhost:8080/api/v1/jobs/$($job.id)"
-Invoke-RestMethod http://localhost:8080/api/v1/workers
 ```
 
-Read attempt logs with `GET /api/v1/attempts/{attempt_id}/logs?after=0`. Chunks are ordered by sequence; JSON payloads are base64-encoded bytes. Responses contain at most 1,000 chunks; paginate using the last sequence. The executor directly uses argv with the image entrypoint overridden by argv[0]. A shell is used only when explicitly requested in argv, as in the demo's stdout/stderr command. Jobs have no network, host mounts, Docker socket, privileged mode, or host namespaces.
+Submit a static DAG at `/pipelines/new` in the console using its editable JSON example, or `POST /api/v1/pipelines`. Commands are argv arrays; a shell runs only if explicitly requested. Workload containers have no network, host mounts, Docker socket, privileged mode or host namespaces.
 
-Stop services while retaining PostgreSQL data:
+Stop services while retaining PostgreSQL data: `docker compose --profile console --profile tools down`. Do not use `down -v` unless intentionally deleting local state.
 
-```powershell
-docker compose down
-```
+## Pipelines and operational console
 
-## Verify
+Static DAG submissions validate unique keys, dependencies, self-edges and cycles before work becomes runnable. Roots queue immediately; children remain BLOCKED until every required parent succeeds. Fan-out branches execute concurrently when slots exist; fan-in releases transactionally. A retryable parent keeps children blocked. Permanent failure/exhaustion skips unresolved descendants transitively while unrelated branches continue.
 
-Pipeline demos show build → unit-test/lint in parallel → package, both success and permanent branch failure with package SKIPPED. The pipeline recovery demo kills worker-b during test, retains package BLOCKED through lease expiry/retry, rejects stale replay, and proves worker-c success releases package. Like the original recovery demo, it restores all workers and should run without concurrent submissions.
+Job/pipeline cancellation is durable; active reservations remain until a valid stop acknowledgement or lease expiry. Per-attempt timeouts exclude dependency/queue wait, include preparation/reporting, and cannot be extended by lease renewal. Pipelines finalize only after every job is terminal. [Exact precedence/transactions](docs/pipeline-semantics-audit.md).
 
-```powershell
-./scripts/verify.ps1
-./scripts/verify-e2e.ps1
-./scripts/verify-recovery.ps1
-./scripts/demo-recovery.ps1
-./scripts/test-leaseguard.ps1
-```
+The console provides health/capacity, pipeline/job lists, selectable DAGs, current/historical worker sessions, immutable attempt history, fences/deadlines, trace links, cancellation and persisted recovery chronology. Live stdout/stderr uses SSE with sequence-based resume and bounded browser memory. Refresh failures retain an explicitly stale snapshot; the UI never invents an offline timestamp or pretends LOST means physical shutdown. DRAINING is unsupported. [Console/API contract](docs/operational-console-audit.md).
 
-`verify.ps1` checks gofmt, go vet, compilation, unit tests, and race-enabled integration tests against real PostgreSQL. Integration tests use a unique schema per test and remove only that schema. Explicitly requested integration tests fail if `TEST_DATABASE_URL` is missing. `verify-e2e.ps1` tests real Docker execution, stdout/stderr persistence, duplicate result/log delivery, stale fencing, nonzero exit, invalid command, and timeout. The lease-guard script stops the Control Plane, proves the old job container stops without renewal ACKs, then checks recovery after restart.
+![Static fan-out/fan-in pipeline](docs/assets/console/pipeline-dag.png)
 
-`verify-recovery.ps1` mounts the Docker socket into the development test runner and tests real process deaths at exact assignment/start windows, surviving and overlapping Docker executions, orphan reconciliation, and internal cancellation. It uses isolated database schemas and unique worker/container labels. All verification scripts disable Go test result caching. See the [Gate C audit and coverage matrix](docs/correctness-audit.md) for deterministic transaction races and injected rollback cases.
+[Overview](docs/assets/console/overview.png) · [Workers](docs/assets/console/workers.png) · [Attempt/logs](docs/assets/console/attempt-logs.png) · [Recovery and both attempts](docs/assets/console/recovery.png) · [LOST attempt](docs/assets/console/attempt-lost.png). These are real local states, not fixtures; [capture provenance/reproduction](docs/screenshots.md).
 
-With a local Go toolchain:
+## Demos and verification
 
-```powershell
-go test ./...
-$env:TEST_DATABASE_URL = 'postgres://forgegrid:forgegrid@localhost:5432/forgegrid?sslmode=disable'
-go test -race -tags integration ./...
-# Requires the running Compose stack:
-go test -race -tags e2e ./tests/e2e
-```
+Run demos/verification **sequentially and without other submissions**. Recovery scripts deliberately stop workers and restore them afterward; the frontend suite includes real worker failure.
 
-Regenerate the committed Protobuf Go bindings:
+| Command | What it proves |
+|---|---|
+| `./scripts/demo-normal.ps1` | Authoritative Docker success and both persisted output streams |
+| `./scripts/demo-recovery.ps1` | worker-b → lease expiry → worker-c, higher fence and explicit stale-result rejection |
+| `./scripts/demo-pipeline.ps1` | build → unit-test/lint in parallel → package; success and permanent failure/SKIPPED branch |
+| `./scripts/demo-pipeline-recovery.ps1` | Dependent stays BLOCKED during loss/retry, then releases after valid success |
+| `./scripts/demo-observability.ps1` | Actual normal/recovery Jaeger traces, current retry/expiry metric increments and scrape targets |
+| `./scripts/verify.ps1` | Format, vet, build, uncached race-enabled unit/real PostgreSQL tests |
+| `./scripts/verify-e2e.ps1` | Real Docker execution, protocol/log duplicates, DAGs, failures, timeout/cancellation |
+| `./scripts/verify-recovery.ps1` | Real process crashes at selected commit/start windows; surviving containers/overlap |
+| `./scripts/test-leaseguard.ps1` | Docker stop without renewal ACKs and Control Plane restart recovery |
+| `./scripts/verify-observability.ps1` | Execution with telemetry absent at startup or lost mid-job |
+| `./scripts/verify-frontend.ps1` | Strict TypeScript/build, components, browser fixtures and real Docker/browser recovery |
 
-```powershell
-./scripts/generate-proto.ps1
-```
+Integration tests create isolated PostgreSQL schemas. Trigger faults, advisory barriers and observed row-lock waits establish race/rollback ordering; mocks do not substitute for transactions. Browser fixtures complement real Docker recovery. [Complete release verification and dependency commands](docs/release-audit.md).
 
-## Implementation
+Development defaults: heartbeat 2s, offline threshold 6s, lease 10s, renewal 2s, capacity one per worker session. Retry backoff doubles from 1s to a 30s cap; `max_attempts` is 1–10. Timeout is 1–86,400s (default 30s). DAGs are limited to 128 jobs/2,048 edges.
 
-Milestone 5 adds a React/TypeScript/Vite operational console: worker/session capacity, pipeline DAG inspection, immutable attempt history and fencing/lease details, persisted recovery chronology, live resumable SSE output, existing cancellation and static pipeline submission. PostgreSQL remains authoritative. See [console APIs, semantics and verification](docs/operational-console-audit.md).
+For Vite development, stop the Compose console, then run `npm ci` and `npm run dev` in `frontend`. Regenerate committed Protobuf bindings with `./scripts/generate-proto.ps1`.
 
-```powershell
-docker compose --profile console up -d --build --wait postgres control-plane worker-a worker-b worker-c console
-# Console: http://localhost:5173
-./scripts/verify-frontend.ps1
-```
+## Known limitations
 
-The frontend verification script runs strict checks, production build, component/browser tests and real worker-b → worker-c browser recovery. Run it exclusively, without other submissions/recovery demos. For Vite development, stop the console service, then run `npm ci` and `npm run dev` in `frontend` with the backend running. State views poll; attempt output uses SSE and native sequence-based reconnect, with bounded browser memory. Exact worker offline-transition timestamps are not persisted and are not invented by the UI. DRAINING is explicitly unsupported.
+- **Single Control Plane; no HA or scale guarantees.** Pipeline coordination is deliberately serialized. Sampling overhead grows with retained history.
+- **Trusted local workloads only.** Agent Docker access is powerful; containers are not a hostile multi-tenant sandbox. No public deployment security claim.
+- **No exactly-once physical execution or side-effect guarantee.** An inaccessible Docker daemon can leave an old container running; cleanup/cancellation cannot guarantee remote shutdown.
+- **Logs/traces can be lost.** Bounded queues are not durable spools. Acknowledged logs persist, but crash/cancellation can lose pending chunks. No total log retention policy; local Jaeger is transient.
+- Browser snapshots refresh periodically; exact offline history is unavailable. Offset pages can shift during submissions. Worker history is a bounded inspection window.
+- Submission idempotency, DRAINING, dynamic/matrix DAGs, fail-fast, expressions, artifacts, authentication, secrets and integrations are not implemented.
 
-Milestone 4 adds distributed OpenTelemetry tracing through a Collector to Jaeger, bounded-cardinality Prometheus metrics, and correlated JSON operational logs. Run ./scripts/demo-observability.ps1 for the verified normal/recovery trace URLs; inspect Jaeger at http://localhost:16686 and Prometheus at http://localhost:9092. ./scripts/verify-observability.ps1 checks execution with backends absent or stopped mid-job. Telemetry remains optional for execution. See [observability semantics and evidence](docs/observability-audit.md).
+## Engineering reference
 
-Pipeline HTTP submission uses POST /api/v1/pipelines with a jobs array; each entry adds key and dependencies to the existing image/argv/timeout/max_attempts spec. GET /api/v1/pipelines/{id} returns the DAG's jobs and attempt histories. POST /api/v1/jobs/{id}/cancel and POST /api/v1/pipelines/{id}/cancel persist cancellation before best-effort worker notification. See [pipeline semantics and verification](docs/pipeline-semantics-audit.md) for exact timeout, cancellation, retry, and final-state rules.
+| Document | Purpose |
+|---|---|
+| [Architecture v0.1](docs/architecture-v0.1.md) | Original design/invariants; conceptual scope is marked |
+| [Implementation decisions](docs/implementation-v0.1.md) | Historical milestone decisions |
+| [Execution](docs/execution-semantics.md) / [Failure model](docs/failure-model.md) / [Protocol](docs/protocol.md) | Implemented coordination/transport |
+| [Correctness](docs/correctness-audit.md) / [Pipelines](docs/pipeline-semantics-audit.md) | Races and deterministic evidence |
+| [Observability](docs/observability-audit.md) / [Console](docs/operational-console-audit.md) | Observation boundaries/tests |
+| [Final engineering audit](docs/final-engineering-audit.md) / [Release audit](docs/release-audit.md) | Findings, limitations and verification |
+| [v1.0.0 release notes](docs/releases/v1.0.0.md) / [Portfolio/interview notes](docs/portfolio.md) | Release scope and factual project explanation |
+| [MIT license](LICENSE) / [Dependency notices](docs/licensing.md) | Licensing |
 
-- `cmd/controlplane`, `internal/controlplane`: HTTP/gRPC gateway, transactional scheduling, heartbeat detection, and lease recovery in one process.
-- `cmd/worker`, `internal/worker`: process session UUID, heartbeats, renewal requests, monotonic lease guard, Docker CLI executor, log collector, and startup reconciliation.
-- `internal/domain`: ownership checks, specification validation, result classification, and capped infrastructure retry policy.
-- `internal/store/postgres`, `db/migrations`: explicit pgx SQL, row locks, durable attempts, capacity, duplicate-safe logs, and transactional DAG coordination. Embedded migrations run under a PostgreSQL advisory lock; 002 adds cancellation and 003 adds pipelines/dependencies and execution deadlines. Seven tables; upgrade/reapplication tested.
-- `api/proto/forgegrid/v1`, `gen/go`: versioned contracts and generated bindings.
-- `tests`, `scripts`: Docker end-to-end checks, diagnostic result replay, and repeatable demos.
-
-Development defaults: heartbeat 2s, offline threshold 6s, execution lease 10s, renewal interval 2s, retry base 1s. Set `HEARTBEAT_INTERVAL`, `OFFLINE_THRESHOLD`, `EXECUTION_LEASE`, `LEASE_RENEW_INTERVAL`, and `RETRY_BASE` before Compose startup to override them. Each worker session has capacity one. `max_attempts` defaults to two and is bounded to 1..10. Infrastructure retry delay doubles and caps at 30s. Timeout defaults to 30s and is bounded to 1..86,400 seconds.
-
-See [execution semantics](docs/execution-semantics.md), [failure model](docs/failure-model.md), [protocol](docs/protocol.md), and [implementation decisions](docs/implementation-v0.1.md).
-
-## Limits of this slice
-
-One Control Plane, no HA; static DAGs are bounded to 128 jobs/2,048 edges. No authentication or TLS: console/HTTP/gRPC are for trusted local development with loopback host bindings. Workers require Docker daemon access; this is not a hostile multi-tenant sandbox. Workload containers are non-privileged. Pipeline coordination is deliberately serialized; no scale claim is made. Control Plane/workers upgrade together for execution-budget ACKs.
-
-A process crash can leave a physical container running. Startup reconciliation removes older-session containers for the same worker identity on the accessible daemon; inaccessible machines cannot be remotely cleaned up. Local cancellation attempts Docker removal with a bounded timeout and logs failures, so physical shutdown cannot be guaranteed when the daemon is unavailable. A permanently lost worker's container may require manual removal using its ForgeGrid labels.
-
-Log delivery has a bounded in-memory queue/retries with persistence ACKs. Crashes/cancellation can lose unacknowledged logs; there is no durable spool or total storage retention policy. Browser SSE reads persisted logs; old immutable attempt logs remain diagnostic. Tracing queues and local telemetry retention are bounded; backend outages/crashes may lose spans. Metrics history aggregation has overhead and no scale claim. Submission idempotency keys, DAG mutation, dynamic DAGs, matrix, expressions, fail-fast, artifacts, authentication, secrets, and integrations remain deferred. Public job/pipeline cancellation and the operational console are implemented.
+Code: `cmd/` entry points; `internal/controlplane`, `internal/store/postgres`, `internal/domain` coordination; `internal/worker` execution/guard; `internal/observability` traces/metrics; `api/proto` and `gen/go` contracts; `db/migrations` SQL; `frontend` console; `tests` and `scripts` verification.
