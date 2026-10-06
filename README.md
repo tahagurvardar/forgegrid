@@ -8,6 +8,12 @@ ForgeGrid coordinates outbound gRPC workers and executes argv commands in Docker
 
 This is a verified, trusted-local portfolio project, not a full GitHub Actions/GitLab replacement or a production-ready public deployment.
 
+## Operational console
+
+![Static fan-out/fan-in pipeline](docs/assets/console/pipeline-dag.png)
+
+[Overview](docs/assets/console/overview.png) · [Workers](docs/assets/console/workers.png) · [Attempt/logs](docs/assets/console/attempt-logs.png) · [Recovery and both attempts](docs/assets/console/recovery.png) · [LOST attempt](docs/assets/console/attempt-lost.png). These are real local states, not fixtures; [capture provenance/reproduction](docs/screenshots.md).
+
 ## The signature recovery scenario
 
 ```text
@@ -92,10 +98,6 @@ Static DAG submissions validate unique keys, dependencies, self-edges and cycles
 Job/pipeline cancellation is durable; active reservations remain until a valid stop acknowledgement or lease expiry. Per-attempt timeouts exclude dependency/queue wait, include preparation/reporting, and cannot be extended by lease renewal. Pipelines finalize only after every job is terminal. [Exact precedence/transactions](docs/pipeline-semantics-audit.md).
 
 The console provides health/capacity, pipeline/job lists, selectable DAGs, current/historical worker sessions, immutable attempt history, fences/deadlines, trace links, cancellation and persisted recovery chronology. Live stdout/stderr uses SSE with sequence-based resume and bounded browser memory. Refresh failures retain an explicitly stale snapshot; the UI never invents an offline timestamp or pretends LOST means physical shutdown. DRAINING is unsupported. [Console/API contract](docs/operational-console-audit.md).
-
-![Static fan-out/fan-in pipeline](docs/assets/console/pipeline-dag.png)
-
-[Overview](docs/assets/console/overview.png) · [Workers](docs/assets/console/workers.png) · [Attempt/logs](docs/assets/console/attempt-logs.png) · [Recovery and both attempts](docs/assets/console/recovery.png) · [LOST attempt](docs/assets/console/attempt-lost.png). These are real local states, not fixtures; [capture provenance/reproduction](docs/screenshots.md).
 
 ## Demos and verification
 
